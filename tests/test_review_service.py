@@ -19,6 +19,10 @@ def _seed(database: Database) -> tuple[str, str]:
             JobSnapshot(
                 title="AI 产品经理",
                 company="Example",
+                # 显式给个非目标城市：空 location 现在会走「正文推断城市 → 未知则降级人工」
+                # 的分支（见 test_job_filter 的 blank_location 用例），会让下面几条
+                # 关于定向规则和校招标识的断言变得依赖那条兜底逻辑。
+                location="杭州",
                 description="负责 AI 产品规划和落地",
                 external_id="job-1",
             )

@@ -78,3 +78,46 @@ def test_product_manager_with_explicit_ai_context_needs_manual_review():
 
     assert result.state is RuleState.NEEDS_REVIEW
     assert result.matched_role.startswith("AI Product Manager")
+
+
+def test_mentor_background_years_do_not_kill_a_new_grad_role():
+    """「导师有 10+ 年经验」是团队介绍，不是岗位门槛。"""
+    result = evaluate_linkedin_job_rules(
+        title="AI Product Manager, Early Career",
+        location="New York, NY",
+        description=(
+            "0-2 years experience required. Class of 2027. H1B sponsorship available. "
+            "You will be mentored by leaders with 10+ years of experience."
+        ),
+    )
+    assert result.state is RuleState.ELIGIBLE
+
+
+def test_company_history_years_do_not_kill_a_new_grad_role():
+    """公司宣传语里的「成立 40 年」同样不是岗位门槛。"""
+    result = evaluate_linkedin_job_rules(
+        title="AI Product Manager, University Graduate",
+        location="San Francisco, CA",
+        description=(
+            "We've been innovating fearlessly for 40 years. "
+            "2027 new grad program. Visa sponsorship is available."
+        ),
+    )
+    assert result.state is RuleState.ELIGIBLE
+
+
+def test_real_experience_requirement_is_still_filtered():
+    """真门槛照杀，并把命中的原句写进理由方便人工复核。"""
+    qualifications = evaluate_linkedin_job_rules(
+        title="AI Product Manager",
+        location="New York, NY",
+        description="Qualifications: 8+ years in product management. 2027 start.",
+    )
+    ideal = evaluate_linkedin_job_rules(
+        title="AI Product Manager",
+        location="Austin, TX",
+        description="Ideal Experience 3+ years of experience in a technical role.",
+    )
+    assert qualifications.state is RuleState.FILTERED
+    assert "8+ years" in qualifications.reasons[0]
+    assert ideal.state is RuleState.FILTERED

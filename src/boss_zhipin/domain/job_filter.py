@@ -31,6 +31,7 @@ class RuleMatch:
 
 
 _CAMPUS_SIGNALS = ("2027", "27届", "校招", "校园招聘", "应届", "毕业生")
+_UNKNOWN_CITY_REASON = "岗位未提供城市信息（location 为空且正文无城市线索），需人工确认"
 
 
 def evaluate_job_rules(
@@ -57,8 +58,20 @@ def evaluate_job_rules(
         (city for city in config.target_cities if city.casefold() in location_text),
         None,
     )
+    # capture 层经常拿不到 location（BOSS 把地址放在详情正文的「工作地址」里），
+    # 此时不能当成"不在目标城市"硬杀：先回退正文找城市，仍找不到就留到最后降级人工。
+    city_from_description = False
+    city_unknown = False
     if config.target_cities and matched_city is None:
-        return RuleMatch(RuleState.FILTERED, ("不在目标城市范围",))
+        if location_text.strip():
+            return RuleMatch(RuleState.FILTERED, ("不在目标城市范围",))
+        description_text = description.casefold()
+        matched_city = next(
+            (city for city in config.target_cities if city.casefold() in description_text),
+            None,
+        )
+        city_from_description = matched_city is not None
+        city_unknown = matched_city is None
 
     matched_role = next(
         (role for role in config.target_roles if role.casefold() in title_text),
@@ -89,17 +102,32 @@ def evaluate_job_rules(
                 None,
             )
         if matched_employment_type is None:
+            reasons = ("未找到明确的 2027 校招/应届标识",)
+            if city_unknown:
+                reasons += (_UNKNOWN_CITY_REASON,)
             return RuleMatch(
                 RuleState.NEEDS_REVIEW,
-                ("未找到明确的 2027 校招/应届标识",),
+                reasons,
                 matched_city,
                 matched_role,
             )
 
+    if city_unknown:
+        return RuleMatch(
+            RuleState.NEEDS_REVIEW,
+            (_UNKNOWN_CITY_REASON,),
+            None,
+            matched_role,
+            matched_employment_type,
+        )
+
+    city_reason = ""
+    if matched_city:
+        city_reason = f"城市（正文推断）：{matched_city}" if city_from_description else f"城市：{matched_city}"
     reasons = tuple(
         reason
         for reason in (
-            f"城市：{matched_city}" if matched_city else "",
+            city_reason,
             f"岗位：{matched_role}" if matched_role else "",
             f"招聘类型：{matched_employment_type}" if matched_employment_type else "",
         )

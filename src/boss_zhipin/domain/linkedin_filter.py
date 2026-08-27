@@ -78,6 +78,67 @@ _AI_CONTEXT_SIGNALS = (
     "openai",
 )
 _EXPERIENCED_RE = re.compile(r"\b(?:[3-9]|[1-9]\d)\s*\+?\s*years?\b", re.IGNORECASE)
+# 「N 年经验」只有出现在任职要求语境里才算门槛。JD 里还有两类同形但无关的说法：
+#   1) 导师/团队背景  "you will be mentored by leaders with 10+ years of experience"
+#   2) 公司历史宣传    "we've been innovating fearlessly for 40 years"
+# 这两类以前会把应届岗误杀，所以先按句切分，豁免语境优先于要求语境。
+_EXPERIENCE_EXEMPT_CUES = (
+    "mentor",
+    "mentored",
+    "mentoring",
+    "led by",
+    "leaders with",
+    "leadership team",
+    "our team has",
+    "founded",
+    "we have been",
+    "we've been",
+    "for over",
+    "history",
+    "anniversary",
+    "innovating",
+    "in business",
+    "trusted for",
+)
+_EXPERIENCE_REQUIREMENT_CUES = (
+    "require",
+    "required",
+    "requirement",
+    "must have",
+    "must possess",
+    "minimum",
+    "at least",
+    "qualification",
+    "you have",
+    "you'll have",
+    "you bring",
+    "you'll bring",
+    "looking for",
+    "seeking",
+    "ideal experience",
+    "ideal candidate",
+    "basic experience",
+    "preferred experience",
+    "years of experience",
+    "years in",
+    "years' experience",
+    "experience:",
+)
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?;\n\r•·|]+")
+
+
+def _requires_experience(description: str) -> str | None:
+    """Return the offending requirement sentence, or None when no real threshold."""
+    for raw in _SENTENCE_SPLIT_RE.split(description):
+        sentence = raw.strip()
+        if not sentence or not _EXPERIENCED_RE.search(sentence):
+            continue
+        lowered = sentence.casefold()
+        if any(cue in lowered for cue in _EXPERIENCE_EXEMPT_CUES):
+            continue
+        if any(cue in lowered for cue in _EXPERIENCE_REQUIREMENT_CUES):
+            return sentence
+    return None
 
 
 def evaluate_linkedin_job_rules(
@@ -111,8 +172,13 @@ def evaluate_linkedin_job_rules(
         return RuleMatch(RuleState.FILTERED, ("岗位名称不属于目标 AI/策略产品方向",), matched_city)
 
     senior_signal = next((value for value in _SENIOR_TITLE_SIGNALS if value in title_text), None)
-    if senior_signal or _EXPERIENCED_RE.search(description):
-        reason = f"岗位名称命中资深级别：{senior_signal}" if senior_signal else "岗位要求至少 3 年经验"
+    experience_sentence = None if senior_signal else _requires_experience(description)
+    if senior_signal or experience_sentence:
+        reason = (
+            f"岗位名称命中资深级别：{senior_signal}"
+            if senior_signal
+            else f"岗位要求至少 3 年经验：{experience_sentence[:80]}"
+        )
         return RuleMatch(RuleState.FILTERED, (reason,), matched_city, matched_role)
 
     sponsorship_negative = next(
