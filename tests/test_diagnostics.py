@@ -9,9 +9,10 @@ from boss_zhipin.gui import diagnostics
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch, tmp_path):
     monkeypatch.delenv("BOSS_LANG", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 def test_includes_app_intro_and_logs():

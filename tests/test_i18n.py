@@ -9,9 +9,10 @@ from boss_zhipin.gui import i18n
 
 
 @pytest.fixture(autouse=True)
-def clean_lang(monkeypatch):
-    """每个用例从"没设语言"起步，避免相互污染 os.environ。"""
+def clean_lang(monkeypatch, tmp_path):
+    """每个用例从"没设语言"起步，也不读仓库真实 .env。"""
     monkeypatch.delenv("BOSS_LANG", raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 def test_defaults_to_zh_when_unset():

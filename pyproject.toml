@@ -16,6 +16,7 @@ dependencies = [
     "chromadb>=0.6.3",
     "sentence-transformers>=3.0.0",
     "nodriver>=0.48.1",
+    "sqlalchemy>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,9 @@ standalone = [
 [project.scripts]
 # uv run boss-zhipin 等价于 uv run python -m boss_zhipin / uv run main.py
 boss-zhipin = "boss_zhipin.cli:_cli_main"
+boss-zhipin-capture = "boss_zhipin.capture_cli:main"
+boss-zhipin-daily = "boss_zhipin.daily_cli:main"
+linkedin-job-daily = "boss_zhipin.linkedin_daily_cli:main"
 
 [build-system]
 # Phase D-pre 改造：项目以 src/ 布局变成可安装 package，给 Phase D 用

@@ -30,6 +30,7 @@ _PROJECT_ENV_VARS = (
     # 用户输入兜底
     "BOSS_USR_NAME",
     "BOSS_LABEL",
+    "BOSS_LANG",
     "RESUME_PATH",
     # 老 OpenAI / 模型选项（已弃用）
     "OPENAI_BASE_URL",
@@ -42,6 +43,7 @@ _PROJECT_ENV_VARS = (
     "LETTER_LOG_PATH",
     "BOSS_LLM_TELEMETRY_PATH",
     "BOSS_CHROME_PROFILE",
+    "BOSS_DATABASE_PATH",
     # letter 校验边界
     "LETTER_MIN_LEN",
     "LETTER_MAX_LEN",

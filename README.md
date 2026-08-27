@@ -57,6 +57,61 @@ uv run main.py
 
 脚本会用 `./chrome_profile/` 这个独立目录起 Chrome（**不会动你日常浏览器**）。第一次会被 BOSS 重定向到登录页，自动点上"微信扫码"，你扫一次码登录成功后 cookie 留在 `chrome_profile/`，**后续运行都跳过登录**。
 
+### 只捕捉岗位，不发送消息
+
+`capture-only` 命令只读取当前推荐 feed 并写入本地 SQLite，不需要配置 LLM 或简历，也不会点击“立即沟通”：
+
+```bash
+# 默认最多读取 30 个岗位，保存到 data/reachout.db
+uv run boss-zhipin-capture
+
+# 指定求职标签、数量和数据库路径
+uv run boss-zhipin-capture --label "AI 产品" --limit 10 --database data/reachout.db
+```
+
+首次运行仍需要在弹出的独立 Chrome 中手动扫码。重复运行会更新岗位的最近发现时间，不会重复插入同一岗位。
+
+### 每日定向捕捉（个人求职模式）
+
+`boss-zhipin-daily` 会按已保存的城市和产品方向逐页读取岗位，再用本地规则
+排除非目标城市、非校招、实习和黑名单岗位。它只写入审核队列，**不会发送
+消息**：
+
+```bash
+# 每个“城市 × 搜索词”路由最多读 5 条，本轮总计最多 60 条
+uv run boss-zhipin-daily --per-route 5 --limit 60
+```
+
+未找到明确校招标识的岗位会带“需人工核对”警告进入审核队列，不会被当成已符合
+条件。简历匹配评分需要配置 OpenAI 兼容的 LLM 端点；没有端点时仍可完成捕捉
+和确定性预筛。
+
+### LinkedIn 海外岗位捕捉（免费、本地）
+
+项目内已接入本地修改版的 `frizynn/linkedin-cli`，默认搜索 New York、San
+Francisco、Boston、Washington DC、Austin 的 AI/ML Product Manager、GenAI
+Product Manager 和 Product Strategy 岗位。规则要求明确出现 `2027`；明确不支持
+Sponsorship 的岗位会被过滤，未明确说明 Sponsorship 的岗位进入人工核对。
+
+首次使用，在独立 Chrome 窗口登录一次：
+
+```bash
+uv run --project ../linkedin-cli-frizynn linkedin login
+uv run --project ../linkedin-cli-frizynn linkedin auth-status
+```
+
+登录会话以仅限当前用户读取的文件保存在
+`~/.config/linkedin-cli/storage-state.json`，不会读取日常 Chrome 的加密 Cookie，也
+不会输出 Cookie 内容。随后运行：
+
+```bash
+# 每个“城市 × 搜索词”读取 3 条，本轮最多保留 30 个唯一岗位
+uv run linkedin-job-daily --per-route 3 --limit 30
+```
+
+结果与 BOSS 岗位一起进入桌面 App「待审核」页，并显示平台标签。该命令只抓取、
+去重和筛选，**不会发连接邀请、不会发私信、不会自动投递**。
+
 ---
 
 ## 桌面 App（GUI）
@@ -83,6 +138,11 @@ Standalone 模式的用户数据（`.env` / `chrome_profile/` / `logs/` /
 **界面语言**：GUI 支持中文 / English 切换。「配置」页顶部有「界面语言 · Language」
 下拉，选了即时生效、无需重启，偏好存进 `.env` 的 `BOSS_LANG`。首次启动按系统语言
 自动选一个默认。
+
+**人工审核台**：「待审核」页读取 `data/reachout.db` 中 capture-only 捕捉到的岗位。
+选择岗位后可以调用现有简历匹配和 LLM 能力生成草稿，随后手工编辑、批准或跳过。
+当前批准动作只写入本地待发送状态，**不会打开 BOSS、不会点击立即沟通，也不会发送
+消息**；编辑已批准草稿会自动撤销批准，要求重新确认。
 
 **用不明白？**右上角「🆘 复制Log问AI」一键把 app 介绍 + 版本/系统/配置体检 + 最近
 日志（不含 API key 明文）复制到剪贴板，粘到 ChatGPT / Claude 等任意 AI 就能得到针对性

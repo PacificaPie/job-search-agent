@@ -19,9 +19,13 @@ import logging
 import os
 import subprocess
 import sys
+import urllib.request
 
 import nodriver as uc
-from nodriver import Config
+from nodriver import Config, cdp
+from nodriver.core.util import free_port
+
+from boss_zhipin.domain.models import JobSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +117,10 @@ def _is_logged_in_from_page_state(url: str, info: dict) -> bool:
         return False
     if info.get("loginRequiredVisible"):
         return False
-    return True
+    # Absence of a login wall is not positive proof: on a cold SPA load the DOM
+    # can be empty for several seconds.  Require either a visible account marker
+    # or at least one rendered job card before allowing capture to continue.
+    return bool(info.get("userSignalVisible") or info.get("realJobCardCount", 0) > 0)
 
 
 async def _is_logged_in() -> bool:
@@ -152,12 +159,21 @@ async def _is_logged_in() -> bool:
         '.header-login-btn, a[ka="header-login"], [ka="guide_login_btn_click"], '
         + '.guide-login-btn, .zp-job-list-login-card'
       );
+      const userSignal = document.querySelector(
+        '.nav-figure, .user-nav, .header-user, [ka="header-personal"], '
+        + '[class*="user-avatar"]'
+      );
       const bodyText = document.body ? document.body.innerText || '' : '';
+      const realJobCardCount = Array.from(
+        document.querySelectorAll('.job-card-box')
+      ).filter((card) => (card.innerText || '').trim().length > 0).length;
       return {
         loginWallVisible: visible(wall),
         headerLoginVisible: visible(headerLogin),
         loginRequiredVisible: bodyText.includes('登录查看完整内容')
-          || bodyText.includes('登录账号，查看更多好职位')
+          || bodyText.includes('登录账号，查看更多好职位'),
+        userSignalVisible: visible(userSignal),
+        realJobCardCount
       };
     })());
     """
@@ -204,10 +220,26 @@ async def shutdown() -> None:
     """
     global _browser, _tab
     if _browser is not None:
+        browser = _browser
+        process = getattr(browser, "_process", None)
+        graceful = False
         try:
-            _browser.stop()
+            await browser.connection.send(cdp.browser.close())
+            graceful = True
         except Exception as e:
-            log.warning("browser.stop() 失败（不致命）: %s", e)
+            log.warning("请求 Chrome 正常关闭失败，将强制收尾：%s", e)
+        if graceful and process is not None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=8)
+                log.info("Chrome 已正常关闭，Profile 数据已刷盘")
+            except asyncio.TimeoutError:
+                log.warning("Chrome 正常关闭超时，将强制终止")
+                graceful = False
+        if not graceful:
+            try:
+                browser.stop()
+            except Exception as e:
+                log.warning("browser.stop() 失败（不致命）: %s", e)
     _browser = None
     _tab = None
 
@@ -278,21 +310,75 @@ def _reap_profile_chrome(profile_dir: str) -> None:
     _clear_singleton_locks(profile_dir)
 
 
-async def _start_browser_with_retry(config: Config, attempts: int = 3) -> uc.Browser:
-    """启动并连上 Chrome，失败重试。
+def _cdp_is_ready(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/json/version", timeout=1
+        ) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001 — readiness poll treats all failures as not ready
+        return False
 
-    新版 Chrome（如 149）+ 新 macOS 冷启动时，CDP 端口起得慢，nodriver 第一次连
-    经常 timeout 报 "Failed to connect to browser"，但 Chrome 其实已经起来了 →
-    变孤儿占住 profile。所以每次失败都先 reap（杀掉这次起的、没连上的 Chrome +
-    清锁），再退避重试。
+
+async def _wait_for_cdp(host: str, port: int, timeout: float = 15.0) -> bool:
+    """Wait longer than nodriver's fixed ~2.75s cold-start window."""
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await asyncio.to_thread(_cdp_is_ready, host, port):
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def _terminate_browser_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=3)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+async def _start_browser_with_retry(config: Config, attempts: int = 3) -> uc.Browser:
+    """Launch Chrome ourselves, wait for CDP, then let nodriver attach.
+
+    nodriver 0.48.1 only polls Chrome five times at 0.5 second intervals.  A cold
+    Chrome 151 profile can take longer, causing a false "Failed to connect"
+    even though Chrome becomes healthy shortly afterwards.  Owning the process
+    here also lets ``Browser.stop`` clean it up normally after attachment.
     """
     last_err: Exception | None = None
     for i in range(1, attempts + 1):
+        process: asyncio.subprocess.Process | None = None
         try:
-            return await uc.start(config=config)
+            config.host = "127.0.0.1"
+            config.port = free_port()
+            process = await asyncio.create_subprocess_exec(
+                config.browser_executable_path,
+                *config(),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                close_fds=os.name == "posix",
+            )
+            if not await _wait_for_cdp(config.host, config.port):
+                raise RuntimeError(
+                    f"Chrome CDP 未在 15 秒内就绪（{config.host}:{config.port}）"
+                )
+            browser = await uc.start(config=config)
+            # ``uc.start`` sees host+port and attaches instead of spawning.  Give
+            # the returned Browser our process so its normal stop path owns it.
+            browser._process = process  # noqa: SLF001 — nodriver exposes no attach-process API
+            browser._process_pid = process.pid  # noqa: SLF001
+            return browser
         except Exception as e:  # noqa: BLE001
             last_err = e
             log.warning("浏览器启动/连接失败（第 %d/%d 次）：%s", i, attempts, e)
+            if process is not None:
+                await _terminate_browser_process(process)
             _reap_profile_chrome(config.user_data_dir)
             if i < attempts:
                 await asyncio.sleep(2.0 * i)
@@ -375,7 +461,17 @@ async def log_in() -> None:
             log.info("登录成功！cookie 已写入 profile，下次跑应该不用再扫")
             return
         await asyncio.sleep(2)
-    log.warning("登录超时，请确认是否已扫码登录")
+    raise TimeoutError("登录超时，请确认是否已扫码登录")
+
+
+async def navigate_to_url(url: str) -> None:
+    """Navigate the controlled tab to another read-only job search page."""
+
+    if _tab is None:
+        raise RuntimeError("browser is not open")
+    await _tab.get(url)
+    stable_url = await _wait_url_stable(stable_for=1.0, timeout=30)
+    log.info("已切换搜索页，当前URL: %s", stable_url)
 
 
 # ---------- JS 评估辅助 ----------
@@ -555,6 +651,83 @@ async def get_job_description_by_index(index: int) -> str | None:
     jd = _strip_jd_noise(jd)
     log.info("  JD 长度 %d 字符", len(jd))
     return jd
+
+
+async def get_job_snapshot_by_index(index: int) -> JobSnapshot | None:
+    """Return a structured snapshot for the Nth card without initiating contact.
+
+    The existing JD extraction remains the single click/read path.  This helper
+    only reads visible card/detail metadata after that path succeeds; it never
+    queries or clicks the contact button.
+    """
+
+    description = await get_job_description_by_index(index)
+    if description is None:
+        return None
+    metadata = await _safe_evaluate(
+        f"""
+        JSON.stringify((() => {{
+          const cards = document.querySelectorAll('.job-card-box');
+          const card = cards[{index - 1}];
+          if (!card) return {{ok: false, reason: 'card_not_found'}};
+          const detail = document.querySelector(
+            '.job-detail-box, .job-detail-container, .job-detail-body'
+          );
+          const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const firstText = (roots, selectors) => {{
+            for (const root of roots) {{
+              if (!root) continue;
+              for (const selector of selectors) {{
+                const node = root.querySelector(selector);
+                const value = norm(node && (node.innerText || node.textContent));
+                if (value) return value;
+              }}
+            }}
+            return '';
+          }};
+          const roots = [detail, card];
+          const link = card.closest('a[href]') || card.querySelector('a[href]');
+          const href = link ? new URL(link.getAttribute('href'), location.origin).href : '';
+          const pathPart = href ? new URL(href).pathname.split('/').filter(Boolean).pop() || '' : '';
+          const idFromUrl = pathPart.replace(/\\.html$/, '');
+          const externalId =
+            card.getAttribute('data-jobid')
+            || card.getAttribute('data-job-id')
+            || (link && (link.getAttribute('data-jobid') || link.getAttribute('data-job-id')))
+            || idFromUrl
+            || '';
+          return {{
+            ok: true,
+            title: firstText(roots, ['.job-name', '[class*="job-name"]']),
+            company: firstText(roots, [
+              '.company-name', '[class*="company-name"]', '.boss-name'
+            ]),
+            location: firstText(roots, [
+              '.job-area', '[class*="job-area"]', '.company-location'
+            ]),
+            salary: firstText(roots, [
+              '.job-salary', '.salary', '[class*="salary"]'
+            ]),
+            externalId,
+            sourceUrl: href,
+            cardText: norm(card.innerText).slice(0, 1000),
+          }};
+        }})())
+        """,
+        timeout=5,
+    )
+    if metadata and not metadata.get("ok"):
+        log.warning("读取岗位结构化字段失败: %s", metadata.get("reason", "unknown"))
+    return JobSnapshot(
+        title=str(metadata.get("title") or ""),
+        company=str(metadata.get("company") or ""),
+        location=str(metadata.get("location") or ""),
+        salary=str(metadata.get("salary") or ""),
+        description=description,
+        external_id=str(metadata.get("externalId") or "") or None,
+        source_url=str(metadata.get("sourceUrl") or "") or None,
+        raw_payload={"card_text": str(metadata.get("cardText") or "")},
+    )
 
 
 async def get_loaded_job_count() -> int:

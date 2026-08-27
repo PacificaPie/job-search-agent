@@ -16,8 +16,11 @@ from boss_zhipin.website_oper.finding_jobs import (
     _count_real_job_cards,
     _ensure_localhost_bypasses_proxy,
     _is_logged_in_from_page_state,
+    _start_browser_with_retry,
     get_loaded_job_count,
+    get_job_snapshot_by_index,
     return_to_job_list,
+    shutdown,
     scroll_to_load_more_jobs,
     _strip_jd_noise,
 )
@@ -224,7 +227,7 @@ def test_jobs_page_with_login_required_text_is_not_logged_in():
     )
 
 
-def test_jobs_page_without_login_signals_is_logged_in():
+def test_jobs_page_without_positive_signals_is_not_logged_in():
     assert (
         _is_logged_in_from_page_state(
             "https://www.zhipin.com/web/geek/job-recommend",
@@ -233,6 +236,26 @@ def test_jobs_page_without_login_signals_is_logged_in():
                 "headerLoginVisible": False,
                 "loginRequiredVisible": False,
             },
+        )
+        is False
+    )
+
+
+def test_jobs_page_with_visible_user_signal_is_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/job-recommend",
+            {"userSignalVisible": True, "realJobCardCount": 0},
+        )
+        is True
+    )
+
+
+def test_jobs_page_with_real_job_card_is_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/job-recommend",
+            {"userSignalVisible": False, "realJobCardCount": 1},
         )
         is True
     )
@@ -247,6 +270,129 @@ def test_get_loaded_job_count_reads_job_card_count(monkeypatch):
 
         monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
         assert await get_loaded_job_count() == 15
+
+    asyncio.run(scenario())
+
+
+def test_start_browser_waits_for_cdp_then_attaches(monkeypatch):
+    async def scenario():
+        class FakeConfig:
+            browser_executable_path = "/fake/chrome"
+            user_data_dir = "/fake/profile"
+            host = None
+            port = None
+
+            def __call__(self):
+                return [f"--remote-debugging-port={self.port}"]
+
+        class FakeProcess:
+            pid = 123
+            returncode = None
+
+        class FakeBrowser:
+            _process = None
+            _process_pid = None
+
+        process = FakeProcess()
+        browser = FakeBrowser()
+        spawn_calls: list[tuple] = []
+
+        async def fake_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+            return process
+
+        async def fake_wait(host: str, port: int, timeout: float = 15.0):
+            assert host == "127.0.0.1"
+            assert port == 45678
+            return True
+
+        async def fake_start(*, config):
+            assert config.host == "127.0.0.1"
+            assert config.port == 45678
+            return browser
+
+        monkeypatch.setattr(finding_jobs, "free_port", lambda: 45678)
+        monkeypatch.setattr(finding_jobs.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(finding_jobs, "_wait_for_cdp", fake_wait)
+        monkeypatch.setattr(finding_jobs.uc, "start", fake_start)
+
+        result = await _start_browser_with_retry(FakeConfig(), attempts=1)
+        assert result is browser
+        assert browser._process is process
+        assert browser._process_pid == 123
+        assert spawn_calls[0][0] == ("/fake/chrome", "--remote-debugging-port=45678")
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_requests_graceful_browser_close(monkeypatch):
+    async def scenario():
+        sent: list[object] = []
+
+        class FakeConnection:
+            async def send(self, command):
+                sent.append(command)
+
+        class FakeProcess:
+            async def wait(self):
+                return 0
+
+        class FakeBrowser:
+            connection = FakeConnection()
+            _process = FakeProcess()
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        browser = FakeBrowser()
+        monkeypatch.setattr(finding_jobs, "_browser", browser)
+        monkeypatch.setattr(finding_jobs, "_tab", object())
+
+        await shutdown()
+        assert sent
+        assert browser.stopped is False
+        assert finding_jobs._browser is None
+        assert finding_jobs._tab is None
+
+    asyncio.run(scenario())
+
+
+def test_get_job_snapshot_reads_metadata_after_jd(monkeypatch):
+    async def scenario():
+        async def fake_description(index: int):
+            assert index == 2
+            return "Build useful AI products"
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            assert "job-card-box" in js
+            assert "op-btn-chat" not in js
+            assert ".boss-name" in js
+            assert ".company-location" in js
+            assert ".job-salary" in js
+            assert timeout == 5
+            return {
+                "ok": True,
+                "title": "AI Product Manager",
+                "company": "Example",
+                "location": "Shanghai",
+                "salary": "20-30K",
+                "externalId": "abc123",
+                "sourceUrl": "https://www.zhipin.com/job_detail/abc123.html",
+                "cardText": "AI Product Manager Example",
+            }
+
+        monkeypatch.setattr(
+            finding_jobs, "get_job_description_by_index", fake_description
+        )
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        snapshot = await get_job_snapshot_by_index(2)
+        assert snapshot is not None
+        assert snapshot.title == "AI Product Manager"
+        assert snapshot.company == "Example"
+        assert snapshot.description == "Build useful AI products"
+        assert snapshot.external_id == "abc123"
+        assert snapshot.raw_payload == {"card_text": "AI Product Manager Example"}
 
     asyncio.run(scenario())
 

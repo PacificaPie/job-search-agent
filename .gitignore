@@ -44,6 +44,9 @@
 /vectorstores/
 /logs/
 /chrome_profile/
+/data/
+*.db-shm
+*.db-wal
 /assistant.json
 # skill-creator eval workspaces（每次跑 skill eval 都会产出，不需要提交）
 .claude/skills/**/workspace/
