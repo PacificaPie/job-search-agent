@@ -2,12 +2,13 @@ import { useEffect, useState } from "react";
 import RunPage from "./pages/Run";
 import ConfigPage from "./pages/Config";
 import HistoryPage from "./pages/History";
+import ReviewPage from "./pages/Review";
 import UpdateBanner from "./components/UpdateBanner";
 import { useRunStore, useT } from "./store";
 import { ipc } from "./lib/ipc";
 import { isLang } from "./lib/i18n";
 
-type Tab = "run" | "config" | "history";
+type Tab = "run" | "review" | "config" | "history";
 
 // 顶部标题 + tab 区域
 // 设计：editorial 风格 —— 大号衬线标题 + 字距夸张的小 caps tab
@@ -54,7 +55,7 @@ export default function App() {
     <div className="min-h-screen flex flex-col">
       <UpdateBanner />
       <header className="border-b-4 border-[var(--ink)] bg-[var(--paper)]">
-        <div className="max-w-7xl mx-auto px-8 pt-8 pb-2 flex items-baseline gap-10">
+        <div className="max-w-7xl mx-auto px-8 pt-8 pb-2 flex flex-wrap md:flex-nowrap items-baseline gap-x-10 gap-y-4">
           {/* 主标题：oversized serif italic，作为视觉锚点 */}
           <h1 className="font-serif italic text-3xl md:text-4xl leading-none tracking-tight">
             Boss<span className="not-italic font-normal">·</span>Zhipin
@@ -64,7 +65,7 @@ export default function App() {
           </h1>
 
           {/* tab 群：uppercase mono，当前项底部 4px 黑线 */}
-          <nav className="flex gap-8 self-end pb-1">
+          <nav className="flex gap-4 lg:gap-8 self-end pb-1">
             <TabButton current={tab} value="run" onClick={setTab}>
               <span className="inline-flex items-center gap-2">
                 {t("tab.run")}
@@ -74,11 +75,14 @@ export default function App() {
                 )}
               </span>
             </TabButton>
-            <TabButton current={tab} value="config" onClick={setTab}>
-              {t("tab.config")}
+            <TabButton current={tab} value="review" onClick={setTab}>
+              {t("tab.review")}
             </TabButton>
             <TabButton current={tab} value="history" onClick={setTab}>
               {t("tab.history")}
+            </TabButton>
+            <TabButton current={tab} value="config" onClick={setTab}>
+              {t("tab.config")}
             </TabButton>
           </nav>
 
@@ -108,6 +112,7 @@ export default function App() {
       <main className="flex-1 overflow-auto">
         <div className="max-w-7xl mx-auto px-8 py-10">
           {tab === "run" && <RunPage />}
+          {tab === "review" && <ReviewPage />}
           {tab === "config" && <ConfigPage />}
           {tab === "history" && <HistoryPage />}
         </div>

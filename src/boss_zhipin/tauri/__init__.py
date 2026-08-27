@@ -397,6 +397,170 @@ async def get_telemetry_summary() -> dict[str, dict]:
     return {"summary": telemetry_summary(since_records=1000)}
 
 
+# ---------- Local-first human review queue ----------
+
+
+class _ReviewListBody(_CamelModel):
+    offset: int = 0
+    limit: int = 30
+
+
+class _JobIdBody(_CamelModel):
+    job_id: str
+
+
+class _DraftEditBody(_CamelModel):
+    draft_id: str
+    content: str
+
+
+class _DraftDecisionBody(_CamelModel):
+    draft_id: str
+    decision: str
+
+
+def _open_review_database():
+    from boss_zhipin.persistence.database import Database
+
+    database = Database()
+    database.initialize()
+    return database
+
+
+@commands.command()
+async def list_review_jobs(body: _ReviewListBody) -> dict[str, object]:
+    """Return captured jobs plus their latest score and human-review draft."""
+
+    from boss_zhipin.application.review_service import ReviewService
+
+    database = _open_review_database()
+    try:
+        return ReviewService(database).list_jobs(offset=body.offset, limit=body.limit)
+    finally:
+        database.close()
+
+
+def _prepare_review_job(job_id: str) -> None:
+    """Run the existing resume scorer and letter generator for one saved job."""
+
+    from boss_zhipin.application.draft_service import DraftService
+    from boss_zhipin.application.evaluation_service import EvaluationService
+    from boss_zhipin.gui.resume_io import current_resume
+    from boss_zhipin.models.job_matcher import (
+        extract_keywords_from_text,
+        extract_resume_text,
+        should_apply,
+    )
+    from boss_zhipin.models.llm import generate_letter
+    from boss_zhipin.persistence.repositories import (
+        ProfilePreferenceRepository,
+        ProfileRepository,
+    )
+    from boss_zhipin.vectorization import embed_resume
+
+    resume = current_resume()
+    if resume is None:
+        raise ValueError("请先在运行页上传简历 PDF")
+    database = _open_review_database()
+    try:
+        with database.session() as session:
+            profile = ProfileRepository(session).get_active()
+            if profile is None:
+                raise ValueError("还没有求职配置，请先运行一次岗位捕捉")
+            preference = ProfilePreferenceRepository(session).get(profile.id)
+            profile_id = profile.id
+            min_keyword_match = profile.min_keyword_match
+            min_match_score = (
+                preference.min_match_score if preference is not None else profile.min_match_score
+            )
+            exclude_keywords = (
+                list(preference.content_excludes_json)
+                if preference is not None
+                else list(profile.exclude_keywords_json or [])
+            )
+            fixed_greeting = preference.fixed_greeting if preference is not None else ""
+
+        usr_name = environ.get("BOSS_USR_NAME", "").strip()
+        if not fixed_greeting and not usr_name:
+            raise ValueError("请先在运行页或配置页填写你的名字")
+
+        resume_text = extract_resume_text(resume["path"])
+        if not resume_text.strip():
+            raise ValueError("简历 PDF 没有可读取的文字内容")
+        resume_keywords = extract_keywords_from_text(resume_text)
+        vectorstore = embed_resume(resume_text, "./vectorstores")
+
+        def evaluator(description: str) -> dict[str, object]:
+            recommended, details = should_apply(
+                description,
+                resume_keywords,
+                resume_text,
+                min_keyword_match,
+                min_match_score,
+                exclude_keywords,
+                vectorstore,
+            )
+            return {**details, "recommended": recommended}
+
+        EvaluationService(database).evaluate(
+            job_id=job_id,
+            profile_id=profile_id,
+            evaluator=evaluator,
+            model=environ.get("LLM_MODEL", "").strip(),
+        )
+        DraftService(database).generate(
+            job_id=job_id,
+            profile_id=profile_id,
+            generator=(
+                lambda description: fixed_greeting
+                if fixed_greeting
+                else generate_letter(usr_name, vectorstore, description)
+            ),
+        )
+    finally:
+        database.close()
+
+
+@commands.command()
+async def prepare_review_job(body: _JobIdBody) -> dict[str, str]:
+    """Score a captured job and generate a pending draft, never send it."""
+
+    await asyncio.to_thread(_prepare_review_job, body.job_id)
+    return {"status": "prepared"}
+
+
+@commands.command()
+async def update_review_draft(body: _DraftEditBody) -> dict[str, object]:
+    """Save an edited draft and revoke approval when applicable."""
+
+    from boss_zhipin.application.review_service import ReviewService
+
+    database = _open_review_database()
+    try:
+        return ReviewService(database).update_draft(
+            draft_id=body.draft_id,
+            content=body.content,
+        )
+    finally:
+        database.close()
+
+
+@commands.command()
+async def review_draft(body: _DraftDecisionBody) -> dict[str, object]:
+    """Record an explicit human approve/reject decision; this never sends."""
+
+    from boss_zhipin.application.review_service import ReviewService
+
+    database = _open_review_database()
+    try:
+        return ReviewService(database).decide(
+            draft_id=body.draft_id,
+            decision=body.decision,
+        )
+    finally:
+        database.close()
+
+
 # ---------- 检查更新（只提示，不自动下载） ----------
 
 

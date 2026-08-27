@@ -81,6 +81,58 @@ export type TelemetrySummary = {
   }>;
 };
 
+export type ReviewDraft = {
+  id: string;
+  content: string;
+  originalContent: string;
+  validationOk: boolean;
+  validationReasons: string[];
+  reviewState: "pending" | "approved" | "rejected";
+  revision: number;
+  approvedAt: string | null;
+  updatedAt: string;
+};
+
+export type ReviewJob = {
+  job: {
+    id: string;
+    platform: "boss_zhipin" | "linkedin";
+    title: string;
+    company: string;
+    location: string;
+    salary: string;
+    description: string;
+    sourceUrl: string | null;
+    lastSeenAt: string;
+  };
+  evaluation: null | {
+    id: string;
+    score: number | null;
+    reason: string;
+    keywordMatches: string[];
+    degraded: boolean;
+  };
+  draft: ReviewDraft | null;
+  ruleMatch: {
+    state: "eligible" | "needs_review";
+    reasons: string[];
+    matchedCity: string | null;
+    matchedRole: string | null;
+    matchedEmploymentType: string | null;
+  };
+};
+
+export type ReviewQueue = {
+  items: ReviewJob[];
+  total: number;
+  totalCaptured: number;
+  totalEligible: number;
+  totalNeedsReview: number;
+  totalFiltered: number;
+  offset: number;
+  limit: number;
+};
+
 // ---------- wrappers ----------
 
 export const ipc = {
@@ -116,6 +168,14 @@ export const ipc = {
     pyInvoke<{ letters: LetterRecord[] }>("get_letters", { limit }),
   getTelemetrySummary: () =>
     pyInvoke<{ summary: TelemetrySummary }>("get_telemetry_summary", {}),
+  listReviewJobs: (offset: number = 0, limit: number = 30) =>
+    pyInvoke<ReviewQueue>("list_review_jobs", { offset, limit }),
+  prepareReviewJob: (jobId: string) =>
+    pyInvoke<{ status: string }>("prepare_review_job", { jobId }),
+  updateReviewDraft: (draftId: string, content: string) =>
+    pyInvoke<ReviewDraft>("update_review_draft", { draftId, content }),
+  reviewDraft: (draftId: string, decision: "approve" | "reject") =>
+    pyInvoke<ReviewDraft>("review_draft", { draftId, decision }),
   // 检查更新：查 GitHub 最新 release。后端永不抛错，没网时 hasUpdate=false。
   checkForUpdate: () =>
     pyInvoke<UpdateInfo>("check_for_update", {}),
