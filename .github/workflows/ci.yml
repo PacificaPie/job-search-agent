@@ -71,6 +71,10 @@ jobs:
           uv run python -c "from boss_zhipin.application.application_service import ApplicationService"
           uv run python -c "from boss_zhipin.persistence.repositories import ApplicationRepository, ResumeVersionRepository"
           uv run python -c "from boss_zhipin.persistence.schema import ApplicationRow, ResumeVersionRow"
+          uv run python -c "from boss_zhipin.agent.tools import ToolRegistry, Tool, SideEffect, ExternalToolRejected, build_default_registry"
+          uv run python -c "from boss_zhipin.agent.planner import plan_today, DailyState, DailyPlan, Action, ActionKind"
+          uv run python -c "from boss_zhipin.agent.state import collect_state, GHOST_AFTER_DAYS"
+          uv run python -c "from boss_zhipin.agent.plan_cli import main, build_report, render, build_parser"
 
       - name: 跑 pytest
         run: uv run pytest tests/ -v --tb=short

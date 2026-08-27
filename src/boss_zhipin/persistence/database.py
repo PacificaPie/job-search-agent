@@ -7,10 +7,10 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from boss_zhipin.persistence.migrations import run_migrations
+from boss_zhipin.persistence.migrations import MIGRATIONS, run_migrations
 
 
 def default_database_path() -> Path:
@@ -44,6 +44,21 @@ class Database:
 
     def initialize(self) -> tuple[int, ...]:
         return run_migrations(self.engine)
+
+    def pending_migrations(self) -> tuple[int, ...]:
+        """未应用的迁移版本号。只读命令用它来「检查而不改库」。"""
+
+        with self.engine.connect() as connection:
+            exists = connection.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
+            ).first()
+            applied: set[int] = set()
+            if exists is not None:
+                applied = {
+                    int(row[0])
+                    for row in connection.execute(text("SELECT version FROM schema_migrations"))
+                }
+        return tuple(m.version for m in MIGRATIONS if m.version not in applied)
 
     @contextmanager
     def session(self) -> Iterator[Session]:

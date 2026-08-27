@@ -38,6 +38,8 @@ boss-zhipin = "boss_zhipin.cli:_cli_main"
 boss-zhipin-capture = "boss_zhipin.capture_cli:main"
 boss-zhipin-daily = "boss_zhipin.daily_cli:main"
 linkedin-job-daily = "boss_zhipin.linkedin_daily_cli:main"
+# 只读：读本地库现状，打印今日建议动作清单，不抓不发
+reachout-plan = "boss_zhipin.agent.plan_cli:main"
 
 [build-system]
 # Phase D-pre 改造：项目以 src/ 布局变成可安装 package，给 Phase D 用
