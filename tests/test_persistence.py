@@ -30,7 +30,7 @@ def test_default_database_path_can_be_overridden(monkeypatch, tmp_path):
 def test_initialize_is_versioned_and_idempotent(tmp_path):
     database = Database(tmp_path / "reachout.db")
     try:
-        assert database.initialize() == (1, 2, 3)
+        assert database.initialize() == (1, 2, 3, 4)
         assert database.initialize() == ()
         with database.engine.connect() as connection:
             tables = {
@@ -47,6 +47,8 @@ def test_initialize_is_versioned_and_idempotent(tmp_path):
                 "evaluations",
                 "drafts",
                 "profile_preferences",
+                "resume_versions",
+                "applications",
             } <= tables
             assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
     finally:
@@ -81,7 +83,7 @@ def test_existing_v1_database_upgrades_without_losing_jobs(tmp_path):
             )
             job_id = job.id
 
-        assert database.initialize() == (2, 3)
+        assert database.initialize() == (2, 3, 4)
         with database.session() as session:
             assert JobRepository(session).get(job_id).title == "Existing job"
             assert session.scalar(select(func.count()).select_from(EvaluationRow)) == 0

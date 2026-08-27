@@ -2,6 +2,7 @@
 
 from sqlalchemy import func, select
 
+from boss_zhipin.application.application_service import ApplicationService
 from boss_zhipin.application.draft_service import DraftService
 from boss_zhipin.application.evaluation_service import EvaluationService
 from boss_zhipin.application.review_service import ReviewService
@@ -64,6 +65,14 @@ def test_evaluate_generate_edit_and_approve(tmp_path):
         approved = service.decide(draft_id=draft_id, decision="approve")
         assert approved["reviewState"] == "approved"
         assert approved["approvedAt"] is not None
+        # 批准同时开一条投递记录（preparing），但不代表已发送
+        assert approved["applicationStatus"] == "preparing"
+        application = ApplicationService(database).get_for_job(job_id)
+        assert application is not None
+        assert application["id"] == approved["applicationId"]
+        assert application["draftId"] == draft_id
+        assert application["channel"] == "boss_chat"
+        assert [entry["status"] for entry in application["statusHistory"]] == ["preparing"]
 
         edited = service.update_draft(
             draft_id=draft_id,
@@ -77,7 +86,10 @@ def test_evaluate_generate_edit_and_approve(tmp_path):
         assert edited["approvedAt"] is None
 
         with database.session() as session:
-            assert session.scalar(select(func.count()).select_from(AuditEventRow)) == 4
+            # evaluation / draft_generated / draft_approved / application_created / draft_edited
+            assert session.scalar(select(func.count()).select_from(AuditEventRow)) == 5
+            event_types = set(session.scalars(select(AuditEventRow.event_type)))
+            assert "application_created" in event_types
     finally:
         database.close()
 

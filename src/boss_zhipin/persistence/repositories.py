@@ -11,12 +11,14 @@ from sqlalchemy.orm import Session
 from boss_zhipin.domain.job_identity import canonical_job_key
 from boss_zhipin.domain.models import JobSnapshot
 from boss_zhipin.persistence.schema import (
+    ApplicationRow,
     AuditEventRow,
     DraftRow,
     EvaluationRow,
     JobRow,
     ProfilePreferenceRow,
     ProfileRow,
+    ResumeVersionRow,
     utc_now,
 )
 
@@ -249,6 +251,112 @@ class DraftRepository:
         self.session.flush()
         return draft
 
+
+class ResumeVersionRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, resume_version_id: str) -> ResumeVersionRow | None:
+        return self.session.get(ResumeVersionRow, resume_version_id)
+
+    def create(
+        self,
+        *,
+        job_id: str | None = None,
+        profile_id: str | None = None,
+        archive_entry_ids: list[str] | None = None,
+        lang: str = "zh",
+        html_path: str = "",
+        pdf_path: str = "",
+    ) -> ResumeVersionRow:
+        if lang not in {"zh", "en"}:
+            raise ValueError(f"unsupported resume language: {lang}")
+        version = ResumeVersionRow(
+            job_id=job_id,
+            profile_id=profile_id,
+            archive_entry_ids_json=archive_entry_ids or [],
+            lang=lang,
+            html_path=html_path,
+            pdf_path=pdf_path,
+        )
+        self.session.add(version)
+        self.session.flush()
+        return version
+
+    def latest_for_job(self, job_id: str) -> ResumeVersionRow | None:
+        return self.session.scalar(
+            select(ResumeVersionRow)
+            .where(ResumeVersionRow.job_id == job_id)
+            .order_by(ResumeVersionRow.created_at.desc(), ResumeVersionRow.id.desc())
+            .limit(1)
+        )
+
+
+class ApplicationRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, application_id: str) -> ApplicationRow | None:
+        return self.session.get(ApplicationRow, application_id)
+
+    def for_job(self, job_id: str) -> ApplicationRow | None:
+        """一个岗位只跟一条投递记录——重复批准同一个岗位不该产生第二条。"""
+
+        return self.session.scalar(
+            select(ApplicationRow)
+            .where(ApplicationRow.job_id == job_id)
+            .order_by(ApplicationRow.created_at.desc(), ApplicationRow.id.desc())
+            .limit(1)
+        )
+
+    def create(
+        self,
+        *,
+        job_id: str,
+        profile_id: str | None = None,
+        draft_id: str | None = None,
+        resume_version_id: str | None = None,
+        channel: str = "boss_chat",
+        status: str = "preparing",
+        note: str = "",
+    ) -> ApplicationRow:
+        application = ApplicationRow(
+            job_id=job_id,
+            profile_id=profile_id,
+            draft_id=draft_id,
+            resume_version_id=resume_version_id,
+            channel=channel,
+            status=status,
+            status_history_json=[
+                {"status": status, "at": utc_now().isoformat(), "note": note}
+            ],
+        )
+        self.session.add(application)
+        self.session.flush()
+        return application
+
+    def append_history(self, application: ApplicationRow, *, status: str, note: str = "") -> None:
+        """JSON 列要整列重新赋值，原地 append 不会被 SQLAlchemy 标记为脏。"""
+
+        application.status_history_json = [
+            *application.status_history_json,
+            {"status": status, "at": utc_now().isoformat(), "note": note},
+        ]
+
+    def list_by_status(
+        self, *, statuses: tuple[str, ...] = (), offset: int = 0, limit: int = 50
+    ) -> list[ApplicationRow]:
+        query = select(ApplicationRow)
+        if statuses:
+            query = query.where(ApplicationRow.status.in_(statuses))
+        query = query.order_by(ApplicationRow.updated_at.desc(), ApplicationRow.id.desc())
+        return list(self.session.scalars(query.offset(offset).limit(limit)))
+
+    def count_by_status(self) -> dict[str, int]:
+        rows = self.session.execute(
+            select(ApplicationRow.status, func.count()).group_by(ApplicationRow.status)
+        )
+        return {status: int(count) for status, count in rows}
 
 class AuditEventRepository:
     def __init__(self, session: Session) -> None:

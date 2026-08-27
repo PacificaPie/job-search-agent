@@ -159,6 +159,67 @@ class DraftRow(Base):
     )
 
 
+class ResumeVersionRow(Base):
+    """一次简历渲染的产物。``job_id`` 为空表示通用母版（蓝图第 4 节）。"""
+
+    __tablename__ = "resume_versions"
+    __table_args__ = (Index("ix_resume_versions_job_created_at", "job_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
+    profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    # 用了 archive.md 哪几条经历（如 ["A1", "B2"]）——红线 2「不编造」的溯源锚点
+    archive_entry_ids_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    lang: Mapped[str] = mapped_column(String(2), nullable=False, default="zh")
+    html_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    pdf_path: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+
+
+class ApplicationRow(Base):
+    """一个岗位的一次投递。回调率/各阶段转化率都从 ``status_history_json`` 算。"""
+
+    __tablename__ = "applications"
+    __table_args__ = (
+        Index("ix_applications_status_updated_at", "status", "updated_at"),
+        Index("ix_applications_job_created_at", "job_id", "created_at"),
+        Index("ix_applications_next_action_due", "next_action_due"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    resume_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("resume_versions.id", ondelete="SET NULL"), nullable=True
+    )
+    draft_id: Mapped[str | None] = mapped_column(
+        ForeignKey("drafts.id", ondelete="SET NULL"), nullable=True
+    )
+    channel: Mapped[str] = mapped_column(String(30), nullable=False, default="boss_chat")
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="preparing")
+    # [{"status": ..., "at": ISO8601, "note": ...}]，全轨迹，不覆盖
+    status_history_json: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    first_response_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    next_action: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    next_action_due: Mapped[datetime | None] = mapped_column(UtcDateTime(), nullable=True)
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 class AuditEventRow(Base):
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_events_created_at", "created_at"),)

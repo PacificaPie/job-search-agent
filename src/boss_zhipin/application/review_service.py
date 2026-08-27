@@ -5,11 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from boss_zhipin.audit import validate_letter
+from boss_zhipin.domain.application_status import ApplicationChannel, ApplicationStatus
 from boss_zhipin.domain.enums import ReviewDecision, ReviewState
 from boss_zhipin.domain.job_filter import JobFilterConfig, RuleMatch, RuleState, evaluate_job_rules
 from boss_zhipin.domain.linkedin_filter import evaluate_linkedin_job_rules
 from boss_zhipin.persistence.database import Database
 from boss_zhipin.persistence.repositories import (
+    ApplicationRepository,
     AuditEventRepository,
     DraftRepository,
     EvaluationRepository,
@@ -171,12 +173,16 @@ class ReviewService:
             draft = DraftRepository(session).get(draft_id)
             if draft is None:
                 raise ValueError(f"draft not found: {draft_id}")
+            application = None
             if parsed is ReviewDecision.APPROVE:
                 if not draft.validation_ok:
                     raise ValueError("draft must pass validation before approval")
                 draft.review_state = ReviewState.APPROVED.value
                 draft.approved_at = utc_now()
                 event_type = "draft_approved"
+                # 批准 = 这条触达进入投递流程。开一条 applications 记录（preparing），
+                # 但**不代表已发送**——发送仍然是人在 BOSS 里手点，见红线 1。
+                application = self._ensure_application(session, draft)
             else:
                 draft.review_state = ReviewState.REJECTED.value
                 draft.approved_at = None
@@ -186,10 +192,49 @@ class ReviewService:
                 event_type,
                 job_id=draft.job_id,
                 profile_id=draft.profile_id,
-                payload={"draft_id": draft.id, "revision": draft.revision},
+                payload={
+                    "draft_id": draft.id,
+                    "revision": draft.revision,
+                    **({"application_id": application.id} if application is not None else {}),
+                },
             )
             session.flush()
-            return self._draft_dict(draft)
+            result = self._draft_dict(draft)
+            if application is not None:
+                result["applicationId"] = application.id
+                result["applicationStatus"] = application.status
+            return result
+
+    @staticmethod
+    def _ensure_application(session, draft):
+        """批准草稿时保证有且只有一条 applications 记录（重复批准不新开）。"""
+
+        applications = ApplicationRepository(session)
+        existing = applications.for_job(draft.job_id)
+        if existing is not None:
+            if existing.draft_id is None:
+                existing.draft_id = draft.id
+            return existing
+        application = applications.create(
+            job_id=draft.job_id,
+            profile_id=draft.profile_id,
+            draft_id=draft.id,
+            channel=ApplicationChannel.BOSS_CHAT.value,
+            status=ApplicationStatus.PREPARING.value,
+            note="审核台批准草稿",
+        )
+        AuditEventRepository(session).record(
+            "application_created",
+            job_id=draft.job_id,
+            profile_id=draft.profile_id,
+            payload={
+                "application_id": application.id,
+                "channel": application.channel,
+                "status": application.status,
+                "draft_id": draft.id,
+            },
+        )
+        return application
 
     @staticmethod
     def _draft_dict(draft) -> dict[str, Any]:

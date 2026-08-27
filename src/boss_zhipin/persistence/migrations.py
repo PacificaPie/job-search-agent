@@ -8,12 +8,14 @@ from dataclasses import dataclass
 from sqlalchemy import Connection, Engine, text
 
 from boss_zhipin.persistence.schema import (
+    ApplicationRow,
     AuditEventRow,
     DraftRow,
     EvaluationRow,
     JobRow,
     ProfilePreferenceRow,
     ProfileRow,
+    ResumeVersionRow,
 )
 
 
@@ -40,10 +42,17 @@ def _create_profile_preferences(connection: Connection) -> None:
     ProfilePreferenceRow.__table__.create(connection, checkfirst=True)
 
 
+def _create_application_tracking(connection: Connection) -> None:
+    # resume_versions 先建：applications 有指向它的外键。
+    ResumeVersionRow.__table__.create(connection, checkfirst=True)
+    ApplicationRow.__table__.create(connection, checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial local-first schema", _create_initial_schema),
     Migration(2, "evaluation and human review schema", _create_review_schema),
     Migration(3, "personal job targeting preferences", _create_profile_preferences),
+    Migration(4, "application tracking and resume versions", _create_application_tracking),
 )
 
 

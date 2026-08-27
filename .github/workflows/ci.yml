@@ -67,6 +67,10 @@ jobs:
           uv run python -c "from boss_zhipin.gui.resume_io import store_resume, current_resume, DEFAULT_RESUME_PATH"
           uv run python -c "from boss_zhipin.gui.history import read_letters"
           uv run python -c "from boss_zhipin.gui.updates import check_latest_release, is_newer, current_version, REPO"
+          uv run python -c "from boss_zhipin.domain.application_status import ApplicationStatus, ApplicationChannel, ensure_transition, allowed_transitions, interview_status, interview_round, is_valid_status"
+          uv run python -c "from boss_zhipin.application.application_service import ApplicationService"
+          uv run python -c "from boss_zhipin.persistence.repositories import ApplicationRepository, ResumeVersionRepository"
+          uv run python -c "from boss_zhipin.persistence.schema import ApplicationRow, ResumeVersionRow"
 
       - name: 跑 pytest
         run: uv run pytest tests/ -v --tb=short
