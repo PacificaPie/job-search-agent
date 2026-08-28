@@ -1,0 +1,313 @@
+# BOSS 直聘自动打招呼脚本
+
+> **🤖 If You are AI agents **：当用户问"怎么装这个项目"、"`uv` 命令找不到"、"扫码扫不上"、"`DEEPSEEK_API_KEY` 怎么填"之类的小白问题时，**请直接加载并使用本仓库的 [`boss-zhipin-onboarding`](.claude/skills/boss-zhipin-onboarding/) skill**。它自带 5 步里程碑流程、`scripts/check-env.sh` 一键诊断脚本，以及面向零基础用户的沟通规范，比你从这份 README 重新组织一遍引导更可靠。
+[中文](README.md) · [English](README_EN.md)
+
+读 BOSS 上的岗位描述，用 LLM 给 HR 生成一封礼貌的打招呼语，按规则审核后再发送。走**任意 OpenAI 兼容端点**（DeepSeek / OpenAI / Claude / 通义千问·百炼 / 智谱GLM / 豆包 / Kimi / 本地 Ollama …），配好 `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_MODEL` 三个变量就能起跑。
+
+> 原作者已经暂停维护，目前由我和小伙伴们继续优化。已完成迁移到 [uv](https://docs.astral.sh/uv/) 管理依赖、移除 langchain 全家桶、把浏览器自动化从 Selenium 迁到 [nodriver](https://github.com/ultrafunkamsterdam/nodriver)（绕过 BOSS 反爬更稳）。
+
+> ⚠️ 请勿用本脚本割韭菜。能被逼到用脚本投简历的人，身上没啥油水可榨。
+
+---
+
+## 免责声明
+
+- 本项目是**免费、开源**的个人求职辅助工具，按 [MIT 许可证](LICENSE) 提供，**不收费、不接受打赏、不做任何商业化**。
+- 使用浏览器自动化访问 BOSS 直聘**可能违反其服务条款**。是否使用、如何使用，以及由此产生的任何后果（账号风险、法律风险等），**均由使用者自行承担**。
+- 本软件按「现状」（AS IS）提供，**不附带任何形式的担保**。作者与贡献者不对使用本软件造成的任何损失或纠纷负责。
+- 请仅将本工具用于**个人求职**用途，发送前自行审阅生成的招呼语；请勿用于高频群发、骚扰或任何损害他人的目的。
+
+---
+
+## 快速开始（5 分钟）
+
+### 前置
+
+- Python >= 3.11
+- macOS / Linux / Windows（脚本目前只支持 Chrome / Chromium，nodriver 不支持 Edge/Safari）
+- 装好 Chrome（不是 Chromium beta，普通 stable 即可）
+- 装好 [uv](https://docs.astral.sh/uv/)：`curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+### 跑起来
+
+```bash
+# 1. clone + 安装依赖
+git clone https://github.com/longsizhuo/BossZhiPin_Job_Search.git
+cd BossZhiPin_Job_Search
+uv sync
+
+# 2. 配 API key
+cp .env.example .env
+# 编辑 .env，至少填一个 LLM provider 的 key（详见下方 .env 字段说明）
+
+# 3. 准备简历
+mkdir -p resume
+# 把你的 PDF 简历复制进去，命名 my_cover.pdf
+# 或者在 .env 设 RESUME_PATH 指向别的位置
+
+# 4. dry-run 试一下（只生成、不发送）
+DRY_RUN=1 uv run main.py
+
+# 5. 确认 logs/letters.jsonl 里的招呼语质量 OK，再去掉 DRY_RUN 真跑
+uv run main.py
+```
+
+### 首次运行：扫码登录
+
+脚本会用 `./chrome_profile/` 这个独立目录起 Chrome（**不会动你日常浏览器**）。第一次会被 BOSS 重定向到登录页，自动点上"微信扫码"，你扫一次码登录成功后 cookie 留在 `chrome_profile/`，**后续运行都跳过登录**。
+
+### 只捕捉岗位，不发送消息
+
+`capture-only` 命令只读取当前推荐 feed 并写入本地 SQLite，不需要配置 LLM 或简历，也不会点击“立即沟通”：
+
+```bash
+# 默认最多读取 30 个岗位，保存到 data/reachout.db
+uv run boss-zhipin-capture
+
+# 指定求职标签、数量和数据库路径
+uv run boss-zhipin-capture --label "AI 产品" --limit 10 --database data/reachout.db
+```
+
+首次运行仍需要在弹出的独立 Chrome 中手动扫码。重复运行会更新岗位的最近发现时间，不会重复插入同一岗位。
+
+### 每日定向捕捉（个人求职模式）
+
+`boss-zhipin-daily` 会按已保存的城市和产品方向逐页读取岗位，再用本地规则
+排除非目标城市、非校招、实习和黑名单岗位。它只写入审核队列，**不会发送
+消息**：
+
+```bash
+# 每个“城市 × 搜索词”路由最多读 5 条，本轮总计最多 60 条
+uv run boss-zhipin-daily --per-route 5 --limit 60
+```
+
+未找到明确校招标识的岗位会带“需人工核对”警告进入审核队列，不会被当成已符合
+条件。简历匹配评分需要配置 OpenAI 兼容的 LLM 端点；没有端点时仍可完成捕捉
+和确定性预筛。
+
+### LinkedIn 海外岗位捕捉（免费、本地）
+
+项目内已接入本地修改版的 `frizynn/linkedin-cli`，默认搜索 New York、San
+Francisco、Boston、Washington DC、Austin 的 AI/ML Product Manager、GenAI
+Product Manager 和 Product Strategy 岗位。规则要求明确出现 `2027`；明确不支持
+Sponsorship 的岗位会被过滤，未明确说明 Sponsorship 的岗位进入人工核对。
+
+首次使用，在独立 Chrome 窗口登录一次：
+
+```bash
+uv run --project ../linkedin-cli-frizynn linkedin login
+uv run --project ../linkedin-cli-frizynn linkedin auth-status
+```
+
+登录会话以仅限当前用户读取的文件保存在
+`~/.config/linkedin-cli/storage-state.json`，不会读取日常 Chrome 的加密 Cookie，也
+不会输出 Cookie 内容。随后运行：
+
+```bash
+# 每个“城市 × 搜索词”读取 3 条，本轮最多保留 30 个唯一岗位
+uv run linkedin-job-daily --per-route 3 --limit 30
+```
+
+结果与 BOSS 岗位写入同一个岗位库，但分别归属「海外 New Grad」和「国内校招」
+Campaign。两条线保留各自的召回、筛选与打分口径，不直接混排分数。该命令只抓取、
+去重和筛选，**不会发连接邀请、不会发私信、不会自动投递**。
+
+BOSS 线使用平台中由本人设置的固定招呼语：本系统负责发现、排序和记录值得沟通的
+岗位，不再要求为每个 BOSS 岗位生成个性化草稿，也不会代替本人点击「立即沟通」。
+海外线则可以在人工选中岗位后继续准备定制简历和英文 outreach。
+
+---
+
+## 桌面 App（GUI）
+
+两种跑法（设计细节见 [ADR-005](docs/wiki/adr/005-pytauri-standalone.md)）：
+
+```bash
+# 开发模式：Python 主进程 + pytauri-wheel（uv sync 默认就装 tauri 组）
+uv sync
+uv run python -m boss_zhipin.tauri
+
+# 不想装桌面 App 那一坨（纯 CLI 用户）：
+# uv sync --no-group tauri
+
+# Standalone .app（macOS）：打一个双击就能跑的 bundle
+./scripts/build_standalone.sh
+# 产物在 src-tauri/target/bundle-release/bundle/macos/
+```
+
+Standalone 模式的用户数据（`.env` / `chrome_profile/` / `logs/` /
+`vectorstores/`）落在 `~/Library/Application Support/com.longsizhuo.boss-zhipin/`，
+跟 repo 目录互不干扰。
+
+**界面语言**：GUI 支持中文 / English 切换。「配置」页顶部有「界面语言 · Language」
+下拉，选了即时生效、无需重启，偏好存进 `.env` 的 `BOSS_LANG`。首次启动按系统语言
+自动选一个默认。
+
+**人工审核台**：「待审核」页读取 `data/reachout.db` 中 capture-only 捕捉到的岗位。
+选择岗位后可以调用现有简历匹配和 LLM 能力生成草稿，随后手工编辑、批准或跳过。
+当前批准动作只写入本地待发送状态，**不会打开 BOSS、不会点击立即沟通，也不会发送
+消息**；编辑已批准草稿会自动撤销批准，要求重新确认。
+
+**用不明白？**右上角「🆘 复制Log问AI」一键把 app 介绍 + 版本/系统/配置体检 + 最近
+日志（不含 API key 明文）复制到剪贴板，粘到 ChatGPT / Claude 等任意 AI 就能得到针对性
+帮助——给只下载 release、不会看代码的用户兜底。
+
+---
+
+## `.env` 字段速查
+
+仓库根目录的 [`.env.example`](.env.example) 是完整模板，几个关键字段：
+
+| 字段 | 作用 | 必填 |
+|---|---|---|
+| `LLM_API_KEY` | LLM 端点的 API key（各家申请地址见 `.env.example`） | 是 |
+| `LLM_BASE_URL` | 端点 base_url，留空 = OpenAI 默认端点（如 `https://api.deepseek.com`） | 否（默认 OpenAI 端点） |
+| `LLM_MODEL` | 模型名（如 `deepseek-chat` / `gpt-4o` / `claude-sonnet-4-6`） | 是 |
+| `BOSS_USR_NAME` | 你的名字，会出现在招呼语署名里 | 否（不填会启动时问你） |
+| `BOSS_LABEL` | 求职 tag，比如"后端开发（成都）" | 否（不填就用 BOSS 默认推荐 feed） |
+| `RESUME_PATH` | 简历 PDF 路径 | 否（默认 `./resume/my_cover.pdf`） |
+| `DRY_RUN` | `1` = 只生成不发送 | 否 |
+| `BOSS_MIN_MATCH_SCORE` | LLM 匹配分阈值 | 否（默认 50） |
+| `BOSS_EXCLUDE_KEYWORDS` | 岗位黑名单关键字（用逗号分隔，如"外包,驻场"） | 否 |
+| `BOSS_LANG` | GUI 界面语言（`zh` / `en`），一般在「配置」页切换、自动写入 | 否（默认跟随系统） |
+| `LOGLEVEL` | 日志级别 | 否（默认 INFO） |
+
+不分 provider，统一一个 OpenAI 兼容端点。`LLM_API_KEY` 没填会列出各家 signup 链接然后退出；填好直接起跑。GUI 配置页有「常用快捷」下拉，选了会自动填好 `LLM_BASE_URL` + `LLM_MODEL`。
+
+---
+
+## 端点怎么选
+
+代码**不认牌子**：任意 OpenAI 兼容端点都走同一条路——本地 chroma 向量库 +
+sentence-transformers 召回简历片段（RAG），再调端点的 `chat.completions` 生成招呼语。
+所以选哪家只是成本 / 中文语感的取舍：
+
+| 端点 | 优势 | 劣势 |
+|---|---|---|
+| DeepSeek | 最便宜，国内直连，质量过得去 | —— |
+| OpenAI | 生态成熟 | 每次调用比 DeepSeek 贵不少，国内需代理 |
+| Claude | 招呼语风格最自然 | 模型本身贵，但走 RAG 单次 token 少 |
+| 通义千问·百炼 / 智谱GLM / 豆包 / Kimi / 本地 Ollama … | 国内直连 / 可本地跑 | 视端点而定 |
+
+首次跑会下载 ~430MB 的 embedding 模型（all-mpnet-base-v2），跟选哪个端点无关。
+
+---
+
+## 安全：dry-run + 审计日志
+
+每封生成的招呼语在发送前都会过 [`audit.py`](audit.py) 里的 `validate_letter`：
+- 长度区间检查（默认 30~800 字符）
+- 必须包含中文字符
+- 黑名单关键词（"Error"、"Traceback"、"As an AI"、"```" 等），命中即拦截
+
+无论是发送成功、被拦截还是 dry-run，都会追加一行 JSONL 到 `./logs/letters.jsonl`，包括 JD、生成内容、provider、model、validation 结果。复盘事故 / 调 prompt 用得着：
+
+```bash
+tail -f logs/letters.jsonl | jq '{ts, sent, validation_ok, validation_reasons, letter_len}'
+```
+
+---
+
+## Troubleshooting
+
+### 浏览器闪退 / 起不来 / `SessionNotCreatedException`
+旧版本用过 `undetected-chromedriver`，它自带的 chromedriver 跟 Chrome 版本对不齐就崩。本仓库已迁到 [nodriver](https://github.com/ultrafunkamsterdam/nodriver)，**没有 chromedriver**，直接走 CDP，所以这类版本错误结构上不会发生。如果还是闪退，多半是 profile 被锁。
+
+### 容器 / 非 root 环境里 Chrome sandbox 起不来
+少数环境（某些 Docker 镜像、CI runner）里 Chrome 的 sandbox 拉不起来，Chrome 进程直接退出。可在 `.env` 加：
+```bash
+BOSS_NO_SANDBOX=1
+```
+
+Linux/macOS 的 **root 用户不用设** —— nodriver 自己就会在 posix + root 下关掉 sandbox。这个开关是给**非 root 但 sandbox 仍然失败**的场景兜底的。
+
+> 如果你看到的报错是 `Failed to connect to browser`，那多半**不是** sandbox 的问题。nodriver 的报错文案里那句 "One of the causes could be when you are running as root" 是硬编码在异常字符串里的兜底猜测，不是诊断结论 —— 设 `BOSS_NO_SANDBOX=1` 大概率解决不了它。
+
+### Chrome 启动后 profile 显示空白 / "好像不是我的 Chrome"
+对，脚本默认用 **独立 profile**（`./chrome_profile/`），不是你日常 Chrome。这是设计——避免影响你日常浏览器的扩展和登录状态。第一次会让你扫码登录 BOSS，之后 cookie 留在这个独立 profile 里。
+
+想用日常 Chrome 的 cookie？把日常 Chrome 完全退出，然后：
+```bash
+BOSS_CHROME_PROFILE="$HOME/Library/Application Support/Google/Chrome" uv run main.py
+```
+**警告**：日常 Chrome 必须先完全关掉（菜单栏 → Quit Google Chrome），不然 profile 会被锁。
+
+### 弹出 newtab、看不到 BOSS 页面
+旧 profile 里有恢复 tab 时会发生。新版本 ([commit `7dbdf37`](https://github.com/longsizhuo/BossZhiPin_Job_Search/commit/7dbdf37)) 起来直接在新窗口里打开 BOSS，已经修了。
+
+### 卡在 "页面已稳定" 之后不动
+应该没了——之前是 `tab.select(timeout=0)` 在 nodriver 里阻塞。如果还遇到，把控制台输出贴 issue 里。
+
+### 页面一直是"加载中，请稍候"，一条岗位都抓不到
+BOSS 前端是 Vue SPA。CDN 抖动时 Chrome 可能把某个 vendor 脚本的错误响应（522 之类）**缓存进 profile**，之后每次启动都重放这份坏缓存，Vue app 永远 boot 不起来，DOM 里只剩骨架屏空卡。
+
+典型表现：登录态明明是好的（BOSS 的接口直接请求也能正常返回岗位数据），但页面正文始终是"加载中，请稍候"，日志里连续几轮抓不到 JD。
+
+关掉脚本，删掉这两个缓存目录（**别删 `Default/Network/`，登录 cookie 在里面**）：
+```bash
+rm -rf chrome_profile/Default/Cache "chrome_profile/Default/Code Cache"
+```
+Windows PowerShell：
+```powershell
+Remove-Item -Recurse -Force chrome_profile\Default\Cache, "chrome_profile\Default\Code Cache"
+```
+重跑即可，**不需要重新扫码**。
+
+### 提示"❌ 找不到简历文件"
+按提示把 PDF 放到 `./resume/my_cover.pdf`，或者 `.env` 里 `RESUME_PATH=...`。
+
+### 提示"❌ 没找到任何 API key"
+按提示去申请一个填到 `.env`。最少只需要一个。
+
+---
+
+## 项目结构
+
+```
+.
+├── main.py                       # 兼容 shim：uv run main.py 仍然可用，实际委托 boss_zhipin.cli
+├── src/boss_zhipin/              # 业务代码都在这个可安装 package 里
+│   ├── cli.py                    # CLI 入口，处理交互/env 校验（ensure_llm_configured）
+│   ├── providers.py              # 轻量元数据：LLM_PRESETS（常用端点快捷）+ is_llm_configured
+│   ├── models/
+│   │   ├── llm.py                # 通用 OpenAI 兼容端点 client + RAG 招呼语生成
+│   │   └── prompts.py            # 招呼语 prompt 模板
+│   ├── website_oper/
+│   │   ├── finding_jobs.py       # 浏览器自动化（nodriver），sync facade + async impl
+│   │   └── write_response.py     # 单个岗位的主循环：JD → 生成 → 校验 → 发送/日志
+│   ├── vectorization.py          # 简历 PDF 解析 + sentence-transformers 向量化 + Chroma 持久化
+│   ├── audit/                    # 招呼语校验 + JSONL 审计日志 + LLM telemetry
+│   ├── gui/                      # 桌面 App 的胶水层（不依赖 PyTauri 本身）
+│   └── tauri/                    # PyTauri 桌面 App 入口（uv run python -m boss_zhipin.tauri）
+└── .env.example                  # 所有环境变量的注释样板
+```
+
+---
+
+## 想加入维护？
+
+我们寻求更多小伙伴加入。如果你愿意做：
+- Electron 前端 UI
+- 给 BOSS 发简历附件
+- 投递历史 / 自动跟进
+- 多账号支持
+
+发 issue 或者 PR 都行。
+
+---
+
+## 致谢
+
+感谢所有支持本项目的人：
+
+<p align="left">
+    <a href="https://github.com/longsizhuo/BossZhiPin_Job_Search/graphs/contributors">
+        <img width="770" src="https://contrib.rocks/image?repo=longsizhuo/BossZhiPin_Job_Search&max=300&columns=16" />
+    </a>
+</p>
+
+### 衍生项目
+
+- [noBaldAaa/find-job](https://github.com/noBaldAaa/find-job) — 基于 JS 的更简版本
+- [LouisCaixuran/auto_job_find_azure](https://github.com/LouisCaixuran/auto_job_find_azure) — 基于 Azure OpenAI 的版本

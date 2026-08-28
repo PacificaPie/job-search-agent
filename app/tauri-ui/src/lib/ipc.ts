@@ -1,0 +1,202 @@
+/** 类型化的 pyInvoke 封装，所有跟 Python 后端的 IPC 调用都从这里走。
+ * 改 backend 命令 / 返回类型时同步改这里，TypeScript 报错就是 contract 断了的信号。 */
+import { pyInvoke } from "tauri-plugin-pytauri-api";
+
+// ---------- types ----------
+
+export type EventKind =
+  | "browser_started"
+  | "login_ok"
+  | "job_found"
+  | "job_skipped"
+  | "scoring_degraded"
+  | "letter_sent"
+  | "feed_exhausted"
+  | "loop_ended"
+  | "error";
+
+export type ProgressEvent = {
+  kind: EventKind;
+  payload: Record<string, unknown>;
+};
+
+export type RunConfig = {
+  usrName: string;
+  label: string;
+  dryRun: boolean;
+  resumePath?: string;
+};
+
+// LLM 端点预设（自动填 base_url + model 的快捷项；不是支持范围的限制）。
+export type LlmPreset = {
+  name: string;
+  label: string;
+  baseUrl: string;
+  model: string;
+  signupUrl: string;
+};
+
+// 当前 LLM 端点配置 + 预设列表。hasKey 只说有没有配 key，不回传明文。
+export type LlmConfig = {
+  baseUrl: string;
+  model: string;
+  hasKey: boolean;
+  presets: LlmPreset[];
+};
+
+export type EnvField = {
+  key: string;
+  label: string;
+  isSecret: boolean;
+  value: string;
+};
+
+// 当前简历：文件名 + 绝对路径。没设置 / 文件不在时后端返回 null。
+export type ResumeInfo = {
+  filename: string;
+  path: string;
+};
+
+export type LetterRecord = {
+  ts: string;
+  provider: string;
+  model: string;
+  dry_run: boolean;
+  validation_ok: boolean;
+  validation_reasons: string[];
+  sent: boolean;
+  letter_len: number;
+  job_description: string;
+  letter: string;
+};
+
+export type TelemetrySummary = {
+  total_calls: number;
+  total_cost_cny: number;
+  by_provider: Record<string, {
+    calls: number;
+    input_tokens: number;
+    output_tokens: number;
+    cost_cny: number;
+  }>;
+};
+
+export type ReviewDraft = {
+  id: string;
+  content: string;
+  originalContent: string;
+  validationOk: boolean;
+  validationReasons: string[];
+  reviewState: "pending" | "approved" | "rejected";
+  revision: number;
+  approvedAt: string | null;
+  updatedAt: string;
+};
+
+export type ReviewJob = {
+  job: {
+    id: string;
+    platform: "boss_zhipin" | "linkedin";
+    title: string;
+    company: string;
+    location: string;
+    salary: string;
+    description: string;
+    sourceUrl: string | null;
+    lastSeenAt: string;
+  };
+  evaluation: null | {
+    id: string;
+    score: number | null;
+    reason: string;
+    keywordMatches: string[];
+    degraded: boolean;
+  };
+  draft: ReviewDraft | null;
+  ruleMatch: {
+    state: "eligible" | "needs_review";
+    reasons: string[];
+    matchedCity: string | null;
+    matchedRole: string | null;
+    matchedEmploymentType: string | null;
+  };
+};
+
+export type ReviewQueue = {
+  items: ReviewJob[];
+  total: number;
+  totalCaptured: number;
+  totalEligible: number;
+  totalNeedsReview: number;
+  totalFiltered: number;
+  offset: number;
+  limit: number;
+};
+
+// ---------- wrappers ----------
+
+export const ipc = {
+  isRunning: () => pyInvoke<{ running: boolean }>("is_running", {}),
+  // LLM 端点：选预设/自定义 + base_url + model + key。apiKey 留空 = 不动已存 key。
+  getLlmConfig: () => pyInvoke<LlmConfig>("get_llm_config", {}),
+  setLlmConfig: (baseUrl: string, model: string, apiKey: string) =>
+    pyInvoke<{ status: string }>("set_llm_config", { baseUrl, model, apiKey }),
+  startRun: (config: RunConfig, progressChannel: unknown, logChannel: unknown) =>
+    pyInvoke<{ status: string }>("start_run", { config, progressChannel, logChannel }),
+  stopRun: () => pyInvoke<{ status: string }>("stop_run", {}),
+  shutdownBrowser: () => pyInvoke<{ status: string }>("shutdown_browser", {}),
+  getEnvFields: () => pyInvoke<{ fields: EnvField[] }>("get_env_fields", {}),
+  writeEnvFields: (updates: Record<string, string>) =>
+    pyInvoke<{ status: string }>("write_env_fields", { updates }),
+  // UI 语言：读回 .env 的 BOSS_LANG（空 = 没设过，前端用系统探测的默认）。
+  getLanguage: () => pyInvoke<{ lang: string }>("get_language", {}),
+  setLanguage: (lang: string) =>
+    pyInvoke<{ status: string }>("set_language", { lang }),
+  // 招呼语自定义 prompt：prompt 是当前自定义值（空=用默认），default 是内置默认全文。
+  getLetterPrompt: () =>
+    pyInvoke<{ prompt: string; default: string }>("get_letter_prompt", {}),
+  setLetterPrompt: (prompt: string) =>
+    pyInvoke<{ status: string }>("set_letter_prompt", { prompt }),
+  // 简历：set_resume 把拖入的 PDF 复制进 app 数据目录的 resume/；get_resume 读回当前简历。
+  setResume: (path: string) =>
+    pyInvoke<{ filename: string; path: string }>("set_resume", { path }),
+  // 文件选择器选的 PDF：webview 给不到真实路径，只能传字节（base64）。
+  setResumeBytes: (filename: string, dataBase64: string) =>
+    pyInvoke<{ filename: string; path: string }>("set_resume_bytes", { filename, dataBase64 }),
+  getResume: () => pyInvoke<{ resume: ResumeInfo | null }>("get_resume", {}),
+  getLetters: (limit: number = 200) =>
+    pyInvoke<{ letters: LetterRecord[] }>("get_letters", { limit }),
+  getTelemetrySummary: () =>
+    pyInvoke<{ summary: TelemetrySummary }>("get_telemetry_summary", {}),
+  listReviewJobs: (offset: number = 0, limit: number = 30) =>
+    pyInvoke<ReviewQueue>("list_review_jobs", { offset, limit }),
+  prepareReviewJob: (jobId: string) =>
+    pyInvoke<{ status: string }>("prepare_review_job", { jobId }),
+  updateReviewDraft: (draftId: string, content: string) =>
+    pyInvoke<ReviewDraft>("update_review_draft", { draftId, content }),
+  reviewDraft: (draftId: string, decision: "approve" | "reject") =>
+    pyInvoke<ReviewDraft>("review_draft", { draftId, decision }),
+  // 检查更新：查 GitHub 最新 release。后端永不抛错，没网时 hasUpdate=false。
+  checkForUpdate: () =>
+    pyInvoke<UpdateInfo>("check_for_update", {}),
+  // 用系统浏览器打开下载页（后端做了 URL 白名单校验）。
+  openReleasePage: (url: string) =>
+    pyInvoke<{ status: string }>("open_release_page", { url }),
+  // 出错卡片：打开本仓库 issues（系统浏览器跳转，不自动上报任何日志）。
+  openIssuesPage: () =>
+    pyInvoke<{ status: string }>("open_issues_page", {}),
+  // 出错卡片：日志文件夹路径（让用户知道去哪手动捞日志）。
+  getLogDir: () =>
+    pyInvoke<{ dir: string }>("get_log_dir", {}),
+  // 「复制信息去问 AI」：把 app 上下文 + 传入的实时日志打成可直接粘给 AI 的 markdown。
+  getAiHelpReport: (logs: string[]) =>
+    pyInvoke<{ text: string }>("get_ai_help_report", { logs }),
+};
+
+// 检查更新返回：当前版本 / 最新版本 / 下载页 URL / 是否有新版。
+export type UpdateInfo = {
+  current: string;
+  latest: string;
+  url: string;
+  hasUpdate: boolean;
+};
