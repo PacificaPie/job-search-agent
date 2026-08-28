@@ -1,0 +1,1036 @@
+"""nodriver-backed BOSS automation.
+
+整个模块对外**全部是 async 函数**。调用方（``write_response.py`` 主循环）
+也必须 async，并由 ``main.py`` 用 ``uc.loop().run_until_complete(...)`` **整段
+跑在一个事件循环里**。
+
+为什么这么设计：之前对外是 sync facade（每个公开函数内部 ``_run`` 调一次
+``uc.loop().run_until_complete``），结果每次 enter/exit 事件循环都让 nodriver
+的 CDP websocket 进入半死状态，下一次 evaluate 直接 hang 到 timeout。
+``scripts/probe_click_card.py`` 单 coroutine 跑同样的 evaluate 是秒返回，
+证实就是 sync facade 模式跟 nodriver 的活跃性需求不兼容。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+import urllib.request
+
+import nodriver as uc
+from nodriver import Config, cdp
+from nodriver.core.util import free_port
+
+from boss_zhipin.domain.models import JobSnapshot
+
+log = logging.getLogger(__name__)
+
+# 持久化 Chrome profile：第一次手动扫码后 cookie 会留下，之后跑就跳过登录。
+# 可用 BOSS_CHROME_PROFILE 环境变量覆盖路径。
+CHROME_PROFILE_DIR = os.path.abspath(
+    os.environ.get("BOSS_CHROME_PROFILE", "./chrome_profile")
+)
+
+_browser: uc.Browser | None = None
+_tab: uc.Tab | None = None
+
+
+def _env_flag_true(name: str) -> bool:
+    """环境变量布尔开关解析：1/true/yes/on 视为真。"""
+    value = os.environ.get(name, "")
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_disable_sandbox() -> bool:
+    """是否关闭 Chrome sandbox。
+
+    优先级：
+    1) 显式环境变量 ``BOSS_NO_SANDBOX=1`` 强制关闭；
+    2) Linux/macOS 下检测到 root 用户时自动关闭；
+    3) 其他情况保持开启。
+
+    第 2 条 nodriver 的 ``Config.__init__`` 自己也会做（posix + root 时置
+    ``sandbox=False``），这里重复一遍只为能在日志里提前告知用户。
+    """
+    if _env_flag_true("BOSS_NO_SANDBOX"):
+        return True
+
+    geteuid = getattr(os, "geteuid", None)
+    if callable(geteuid):
+        try:
+            return geteuid() == 0
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+def _apply_sandbox_setting(config) -> bool:
+    """按需在 ``config`` 上关掉 Chrome sandbox，返回最终是否启用 sandbox。
+
+    **必须改 ``config.sandbox``，不能走 ``uc.start(sandbox=...)``**：nodriver 的
+    ``util.start`` 只在 ``if not config:`` 分支里把 ``sandbox`` 传进 ``Config``，
+    我们这里一定自己建 Config 再传进去，那个 kwarg 会被静默丢弃（不报错、不生效）。
+    ``--no-sandbox`` 最终由 ``Config.__call__`` 依据 ``self.sandbox`` 生成。
+
+    只在需要关闭时赋值：nodriver 在 posix + root 下已自行置 False，无条件赋 True
+    会把上游这份自动处理覆盖掉。
+    """
+    if _should_disable_sandbox():
+        config.sandbox = False
+        return False
+    return bool(getattr(config, "sandbox", True))
+
+
+def get_tab() -> uc.Tab | None:
+    """同步读当前控制的 Tab 引用。仅用作内省。"""
+    return _tab
+
+
+def get_driver():
+    raise RuntimeError(
+        "get_driver() 已移除：项目已迁到 nodriver，没有 Selenium driver。"
+        "请改用 finding_jobs 里的 async helper（get_text_by_css/click_by_xpath/"
+        "wait_for_css/send_chat_message/navigate_back）。"
+    )
+
+
+def _on_login_page(url: str) -> bool:
+    return any(s in url for s in ("/web/user/", "passport-zp", "/login"))
+
+
+def _is_logged_in_from_page_state(url: str, info: dict) -> bool:
+    """从 URL + DOM 探测结果判断登录态。
+
+    BOSS 未登录时不一定停在登录页：可能落在职位列表页，但顶部仍有
+    "登录/注册"，详情正文也会显示"登录查看完整内容"。这些都必须判为未登录，
+    否则主流程会误以为已登录，跳过扫码等待后直接开始抓 JD。
+    """
+    if _on_login_page(url):
+        return False
+    if info.get("loginWallVisible"):
+        return False
+    if info.get("headerLoginVisible"):
+        return False
+    if info.get("loginRequiredVisible"):
+        return False
+    # Absence of a login wall is not positive proof: on a cold SPA load the DOM
+    # can be empty for several seconds.  Require either a visible account marker
+    # or at least one rendered job card before allowing capture to continue.
+    return bool(info.get("userSignalVisible") or info.get("realJobCardCount", 0) > 0)
+
+
+async def _is_logged_in() -> bool:
+    """判定登录态：URL + DOM 双 check。
+
+    早期 BOSS 对未登录用户一定 redirect 到 ``/web/user/`` 类路径，只看 URL 够用。
+    现在它经常**不 redirect**，而是直接在 ``/web/geek/...`` 原地盖一个登录浮层。
+    只看 URL 会把这种情况误判成已登录，后续 ``get_job_description`` 抓到的是
+    浮层背后的 ``<style>`` 噪音（关键词命中 0/2 → feed_exhausted 假阴性）。
+
+    所以加一层 DOM 探测：页面里有可见的登录浮层就强制判未登录。选不到浮层时
+    退回原 URL 判定，避免 BOSS 改 class 名后把真实已登录态误杀。
+    """
+    if _tab is None:
+        return False
+    # URL 命中已知登录页路径 → 直接未登录，连 DOM 都不用问
+    if _on_login_page(_tab.url):
+        return False
+
+    # BOSS 的登录浮层 class 名换过几版：boss-login-dialog / login-dialog-wrap /
+    # loginDialog 等，统一用 attribute selector 兜
+    js = """
+    JSON.stringify((() => {
+      const visible = (el) => {
+        if (!el) return false;
+        const cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const wall = document.querySelector(
+        '[class*="login-dialog"], [class*="boss-login"], '
+        + '[class*="loginDialog"], [class*="login-wrap"]'
+      );
+      const headerLogin = document.querySelector(
+        '.header-login-btn, a[ka="header-login"], [ka="guide_login_btn_click"], '
+        + '.guide-login-btn, .zp-job-list-login-card'
+      );
+      const userSignal = document.querySelector(
+        '.nav-figure, .user-nav, .header-user, [ka="header-personal"], '
+        + '[class*="user-avatar"]'
+      );
+      const bodyText = document.body ? document.body.innerText || '' : '';
+      const realJobCardCount = Array.from(
+        document.querySelectorAll('.job-card-box')
+      ).filter((card) => (card.innerText || '').trim().length > 0).length;
+      return {
+        loginWallVisible: visible(wall),
+        headerLoginVisible: visible(headerLogin),
+        loginRequiredVisible: bodyText.includes('登录查看完整内容')
+          || bodyText.includes('登录账号，查看更多好职位'),
+        userSignalVisible: visible(userSignal),
+        realJobCardCount
+      };
+    })());
+    """
+    info = await _safe_evaluate(js, timeout=5)
+    logged_in = _is_logged_in_from_page_state(_tab.url, info)
+    if not logged_in:
+        log.info("页面上有未登录信号 %s → 判未登录，走扫码", info)
+        return False
+    return True
+
+
+async def _wait_url_stable(stable_for: float = 2.0, timeout: float = 30) -> str:
+    """等到 tab.url 连续 stable_for 秒不变，避开 BOSS 登录页的重定向抖动。"""
+    end = asyncio.get_event_loop().time() + timeout
+    last_url = _tab.url
+    last_change = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() < end:
+        cur = _tab.url
+        now = asyncio.get_event_loop().time()
+        if cur != last_url:
+            last_url = cur
+            last_change = now
+        elif now - last_change >= stable_for:
+            return cur
+        await asyncio.sleep(0.2)
+    return last_url
+
+
+# ---------- 浏览器生命周期 ----------
+
+
+async def shutdown() -> None:
+    """关 Chrome 并清空模块级 ``_browser`` / ``_tab``。
+
+    给 GUI 用——用户点"重置"想从头来一遍时调一次，否则下次
+    ``open_browser_with_options`` 会留旧 Chrome 进程。CLI 不需要：``main.py``
+    退出时 OS 会清理子进程。
+
+    ``Browser.stop()`` 是同步函数，但本函数声明 ``async`` 是为了让 GUI
+    runner 能 ``await shutdown()``（runner 一律 await，sync/async 不混用）。
+
+    重启注意：这只关 Chrome 进程；nodriver 跟 uvloop 的重启不兼容问题需要
+    GUI 入口传 ``loop="asyncio"`` 才能彻底解决（见 project memory）。
+    """
+    global _browser, _tab
+    if _browser is not None:
+        browser = _browser
+        process = getattr(browser, "_process", None)
+        graceful = False
+        try:
+            await browser.connection.send(cdp.browser.close())
+            graceful = True
+        except Exception as e:
+            log.warning("请求 Chrome 正常关闭失败，将强制收尾：%s", e)
+        if graceful and process is not None:
+            try:
+                await asyncio.wait_for(process.wait(), timeout=8)
+                log.info("Chrome 已正常关闭，Profile 数据已刷盘")
+            except asyncio.TimeoutError:
+                log.warning("Chrome 正常关闭超时，将强制终止")
+                graceful = False
+        if not graceful:
+            try:
+                browser.stop()
+            except Exception as e:
+                log.warning("browser.stop() 失败（不致命）: %s", e)
+    _browser = None
+    _tab = None
+
+
+def _clear_singleton_locks(profile_dir: str) -> None:
+    """删掉 profile 里残留的 Singleton 锁文件。
+
+    上次 Chrome 没退干净会留下 ``SingletonLock/Cookie/Socket``，新 Chrome 看到会
+    误判 profile 被占。纯文件操作，便于单测。
+    """
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            os.remove(os.path.join(profile_dir, name))
+        except FileNotFoundError:
+            pass
+        except Exception as e:  # noqa: BLE001 — best-effort 清理，失败不致命
+            log.debug("清 Singleton 锁 %s 跳过：%s", name, e)
+
+
+def _ensure_localhost_bypasses_proxy() -> None:
+    """确保 127.0.0.1/localhost 不走代理。
+
+    用户开了 Clash 等代理后 http_proxy 环境变量会拦截所有 HTTP 请求，
+    包括 nodriver 连 Chrome CDP 的 http://127.0.0.1:<port>/json/version，
+    代理返回 502 → nodriver 报 "Failed to connect to browser"。
+
+    设 env 就够：``ProxyHandler.proxy_open`` 每次请求都现调 ``proxy_bypass``
+    重读环境变量，不受 urllib 缓存 opener 的影响。
+    """
+    # 必须用 or 串联：POSIX 上这俩是独立变量，no_proxy 被设成空串时 get 的
+    # default 分支不执行，读不到 NO_PROXY 就会把用户原有的 bypass 列表覆盖掉。
+    no_proxy = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    existing = [s.strip() for s in no_proxy.split(",") if s.strip()]
+    lowered = {s.lower() for s in existing}  # urllib 比对前也 .lower()
+    missing = [h for h in ("127.0.0.1", "localhost") if h not in lowered]
+    if not missing:
+        return
+    new_val = ",".join(existing + missing)  # 追加，保留原有条目和顺序
+    os.environ["no_proxy"] = new_val
+    os.environ["NO_PROXY"] = new_val
+    log.debug("no_proxy 补上 %s → %s", missing, new_val)
+
+
+def _kill_profile_chrome(profile_dir: str) -> None:
+    """杀掉占着本 profile 的残留 Chrome（上次 run 崩了没收掉的孤儿）。
+
+    profile 目录本工具独占，``--user-data-dir=<profile>`` 命中的一定是我们自己的
+    残留，杀掉安全。这是用户实测的"连接失败"根因：上次启动起了 Chrome 但 CDP 没
+    连上，孤儿一直占着 profile，下次再起就被锁。
+    """
+    if sys.platform == "win32":
+        # Windows 按命令行过滤进程不便（无 pkill），跳过——靠清锁 + Chrome 自身的
+        # stale-lock 接管兜底；macOS/Linux 才主动收孤儿。
+        return
+    try:
+        subprocess.run(
+            ["pkill", "-f", os.path.abspath(profile_dir)],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception as e:  # noqa: BLE001 — 没装 pkill / 无匹配都不致命
+        log.debug("pkill 残留 Chrome 跳过：%s", e)
+
+
+def _reap_profile_chrome(profile_dir: str) -> None:
+    """起浏览器前的自清理：先收掉占 profile 的孤儿 Chrome，再清 Singleton 锁。"""
+    _kill_profile_chrome(profile_dir)
+    _clear_singleton_locks(profile_dir)
+
+
+def _cdp_is_ready(host: str, port: int) -> bool:
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/json/version", timeout=1
+        ) as response:
+            return response.status == 200
+    except Exception:  # noqa: BLE001 — readiness poll treats all failures as not ready
+        return False
+
+
+async def _wait_for_cdp(host: str, port: int, timeout: float = 15.0) -> bool:
+    """Wait longer than nodriver's fixed ~2.75s cold-start window."""
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await asyncio.to_thread(_cdp_is_ready, host, port):
+            return True
+        await asyncio.sleep(0.25)
+    return False
+
+
+async def _terminate_browser_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=3)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+async def _start_browser_with_retry(config: Config, attempts: int = 3) -> uc.Browser:
+    """Launch Chrome ourselves, wait for CDP, then let nodriver attach.
+
+    nodriver 0.48.1 only polls Chrome five times at 0.5 second intervals.  A cold
+    Chrome 151 profile can take longer, causing a false "Failed to connect"
+    even though Chrome becomes healthy shortly afterwards.  Owning the process
+    here also lets ``Browser.stop`` clean it up normally after attachment.
+    """
+    last_err: Exception | None = None
+    for i in range(1, attempts + 1):
+        process: asyncio.subprocess.Process | None = None
+        try:
+            config.host = "127.0.0.1"
+            config.port = free_port()
+            process = await asyncio.create_subprocess_exec(
+                config.browser_executable_path,
+                *config(),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                close_fds=os.name == "posix",
+            )
+            if not await _wait_for_cdp(config.host, config.port):
+                raise RuntimeError(
+                    f"Chrome CDP 未在 15 秒内就绪（{config.host}:{config.port}）"
+                )
+            browser = await uc.start(config=config)
+            # ``uc.start`` sees host+port and attaches instead of spawning.  Give
+            # the returned Browser our process so its normal stop path owns it.
+            browser._process = process  # noqa: SLF001 — nodriver exposes no attach-process API
+            browser._process_pid = process.pid  # noqa: SLF001
+            return browser
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            log.warning("浏览器启动/连接失败（第 %d/%d 次）：%s", i, attempts, e)
+            if process is not None:
+                await _terminate_browser_process(process)
+            _reap_profile_chrome(config.user_data_dir)
+            if i < attempts:
+                await asyncio.sleep(2.0 * i)
+    assert last_err is not None
+    raise last_err
+
+
+async def open_browser_with_options(url: str, browser: str) -> None:
+    """启动 Chrome 并打开 url。``browser`` 仅接受 ``"chrome"``。"""
+    global _browser, _tab
+    if browser != "chrome":
+        raise NotImplementedError(
+            f"browser={browser!r} 不再支持；nodriver 只走 Chrome。"
+        )
+    os.makedirs(CHROME_PROFILE_DIR, exist_ok=True)
+    # nodriver 用 urllib 连 Chrome CDP（http://127.0.0.1:<port>/json/version）。
+    # 如果用户开了代理（如 Clash），http_proxy 会拦截 localhost 请求导致 502。
+    _ensure_localhost_bypasses_proxy()
+    # 起之前先收掉上次没退干净、占着本 profile 的孤儿 Chrome + 清残留锁，
+    # 否则会复现用户实测的 "Failed to connect to browser"（profile 被旧实例锁住）。
+    _reap_profile_chrome(CHROME_PROFILE_DIR)
+    config = Config()
+    config.user_data_dir = CHROME_PROFILE_DIR
+    config.headless = False
+    # 注意：这里只影响 Chrome 进程能不能起来，跟 nodriver 连不上 CDP 时抛的
+    # "Failed to connect to browser" 是两条不同的链路，别拿它当那个报错的解药。
+    if _apply_sandbox_setting(config):
+        log.info("Chrome sandbox: enabled")
+    else:
+        log.warning("Chrome sandbox: disabled（root 或 BOSS_NO_SANDBOX=1，按需使用）")
+    _browser = await _start_browser_with_retry(config)
+
+    # 持久化 profile 启动时 Chrome 会把上次的 tab 都恢复出来；脚本控制的 tab
+    # 直接放到一个独立的新窗口里，跟历史窗口井水不犯河水，新窗口默认抢焦。
+    _tab = await _browser.get(url, new_window=True)
+    try:
+        await _tab.activate()
+        await _tab.bring_to_front()
+    except Exception as e:
+        log.warning("激活控制 tab 失败（%s），不影响后续操作", e)
+
+    log.info("页面加载中... 当前URL: %s", _tab.url)
+    stable_url = await _wait_url_stable(stable_for=2.0, timeout=30)
+    log.info("页面已稳定，当前URL: %s", stable_url)
+
+
+async def log_in() -> None:
+    """识别登录状态；未登录则点开微信扫码，等用户扫码登录。"""
+    if await _is_logged_in():
+        log.info("检测到已登录（profile: %s），跳过扫码", CHROME_PROFILE_DIR)
+        return
+
+    cur_url = _tab.url
+    log.info("log_in 入口 URL: %s", cur_url)
+
+    if not _on_login_page(cur_url):
+        try:
+            login_btn = await _tab.find("登录", best_match=True, timeout=15)
+            if login_btn:
+                await login_btn.click()
+                log.info("已点击 header 登录入口")
+                await _wait_url_stable(stable_for=2.0, timeout=15)
+        except Exception as e:
+            log.warning("找不到 header 登录入口（%s），尝试直接在当前页找微信入口", e)
+
+    try:
+        wechat_btn = await _tab.find("微信", best_match=True, timeout=10)
+        if wechat_btn:
+            await wechat_btn.click()
+            log.info("已点击微信登录入口，请扫码...")
+        else:
+            log.warning("未自动点上微信入口，请在浏览器里手动选择登录方式")
+    except Exception as e:
+        log.warning("查找微信入口出错（%s），请手动选择登录方式", e)
+
+    log.info("等待扫码登录... (最多 300 秒)")
+    deadline = asyncio.get_event_loop().time() + 300
+    while asyncio.get_event_loop().time() < deadline:
+        if await _is_logged_in():
+            log.info("登录成功！cookie 已写入 profile，下次跑应该不用再扫")
+            return
+        await asyncio.sleep(2)
+    raise TimeoutError("登录超时，请确认是否已扫码登录")
+
+
+async def navigate_to_url(url: str) -> None:
+    """Navigate the controlled tab to another read-only job search page."""
+
+    if _tab is None:
+        raise RuntimeError("browser is not open")
+    await _tab.get(url)
+    stable_url = await _wait_url_stable(stable_for=1.0, timeout=30)
+    log.info("已切换搜索页，当前URL: %s", stable_url)
+
+
+# ---------- JS 评估辅助 ----------
+
+
+async def _safe_evaluate(js: str, timeout: float = 10) -> dict:
+    """跑 ``tab.evaluate(js)``，期望 JS 自己 ``JSON.stringify`` 返回字符串。
+
+    自带 ``asyncio.wait_for`` 兜底 + JSON 解析容错 —— 永远不抛、永远返回 dict
+    （失败时空 dict）。
+    """
+    js_head = js.strip()[:80].replace("\n", " ")
+    try:
+        raw = await asyncio.wait_for(_tab.evaluate(js), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning("evaluate 超过 %ss 没返回（JS: %s...）", timeout, js_head)
+        return {}
+    except Exception as e:
+        log.warning("evaluate 抛 %s: %s（JS: %s...）", type(e).__name__, e, js_head)
+        return {}
+    if isinstance(raw, tuple):
+        raw = raw[0]
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as e:
+            log.warning("JS 返回不是合法 JSON：%s（前 200 字符：%r）", e, raw[:200])
+            return {}
+    if isinstance(raw, dict):
+        return raw
+    log.warning(
+        "evaluate 返回类型 %s（不是 str/dict）：%r", type(raw).__name__, repr(raw)[:200]
+    )
+    return {}
+
+
+async def _js_click_at_index(css_selector: str, index_1: int) -> dict:
+    """在 JS 里点 ``css_selector`` 命中的第 N 个元素（1-indexed）。"""
+    js = f"""
+    JSON.stringify((() => {{
+      try {{
+        const els = document.querySelectorAll({json.dumps(css_selector)});
+        if (els.length < {index_1}) return {{ok: false, total: els.length}};
+        els[{index_1 - 1}].click();
+        return {{ok: true, total: els.length}};
+      }} catch (e) {{
+        return {{ok: false, error: String(e), stack: e.stack || ''}};
+      }}
+    }})())
+    """
+    return await _safe_evaluate(js)
+
+
+async def _js_wait_text(
+    css_selector: str, min_len: int, timeout_s: float
+) -> str | None:
+    """轮询直到 ``css_selector`` 命中且 ``text.length >= min_len``，返回 text；超时返回 None。"""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        js = f"""
+        JSON.stringify((() => {{
+          try {{
+            const el = document.querySelector({json.dumps(css_selector)});
+            if (!el) return {{ok: false, reason: 'not_found'}};
+            // 用 innerText 而非 textContent：BOSS 反爬往 JD 里塞了 <style> 块（其 CSS
+            // 源码会被 textContent 读出来）+ display:none / width:0.1px 的隐藏诱饵 span
+            // （逐字插 "来自BOSS直聘"/"kanzhun" 把真词劈开，导致关键词匹配全废、命中骤降）。
+            // innerText 只返回「渲染可见」文本，自动排除 <style> 源码和隐藏元素，拿到干净
+            // JD 正文。诊断见 scripts/probe_jd_extract.py（s1=textContent 脏 / s2=innerText 净）。
+            const text = (el.innerText || '').trim();
+            if (text.length < {min_len}) return {{ok: false, reason: 'too_short', len: text.length}};
+            return {{ok: true, text: text}};
+          }} catch (e) {{
+            return {{ok: false, error: String(e)}};
+          }}
+        }})())
+        """
+        result = await _safe_evaluate(js, timeout=5)
+        if result.get("ok"):
+            return result["text"]
+        await asyncio.sleep(0.5)
+    return None
+
+
+async def _xpath_safe(xp: str, timeout: float = 3.0) -> list:
+    """``tab.xpath`` 的兜底封装（保留给 ``select_dropdown_option`` 用，主路径已不依赖它）。"""
+    try:
+        result = await asyncio.wait_for(
+            _tab.xpath(xp, timeout=timeout),
+            timeout=timeout + 2,
+        )
+        return result or []
+    except asyncio.TimeoutError:
+        log.warning("xpath 超时: %s", xp[:80])
+        return []
+    except Exception as e:
+        log.warning("xpath 出错: %s: %s", type(e).__name__, e)
+        return []
+
+
+# ---------- 业务 helper ----------
+
+
+async def select_dropdown_option(label: str) -> None:
+    """空 label 表示用 BOSS 默认推荐 feed，不主动选 tag。"""
+    if not label:
+        log.info("[select_dropdown_option] label 为空，沿用当前推荐 feed")
+        return
+    log.info("[select_dropdown_option] label=%r", label)
+
+    log.info("  路径 1: 找推荐 tag chip ...")
+    chip_xp = (
+        "//*[contains(@class,'recommend-job-btn') and contains(@class,'has-tooltip')]"
+    )
+    chips = await _xpath_safe(chip_xp, timeout=3)
+    log.info("    找到 %d 个 tag chip", len(chips))
+    for el in chips:
+        text = (el.text or "").strip()
+        if label in text:
+            log.info("    → 命中 %r，点击", text)
+            await el.click()
+            return
+
+    log.info("  路径 2: 找下拉菜单触发器 ...")
+    trigger = await _xpath_safe(
+        "//*[@id='wrap']/div[2]/div[1]/div/div[1]/div", timeout=3
+    )
+    if trigger:
+        log.info("    → 点开下拉")
+        await trigger[0].click()
+        await _xpath_safe("//ul[contains(@class,'dropdown-expect-list')]", timeout=3)
+        options = await _xpath_safe(f"//li[contains(text(), '{label}')]", timeout=3)
+        if options:
+            log.info("    → 命中下拉 option %r，点击", label)
+            await options[0].click()
+            return
+        log.info("    下拉里没有 %r", label)
+    else:
+        log.info("    没找到下拉触发器")
+
+    log.info("  路径 3: fallback —— 用 BOSS 默认的推荐 feed 继续（不主动选 tag）")
+
+
+# BOSS 详情面板顶部的 UI 文字（按钮 / 区块标题），不是 JD 正文。innerText 会把它们
+# 带在最前面（"举报\n微信扫码分享\n职位描述\n…"），剥掉让喂给匹配/LLM 的更纯。
+_JD_NOISE_LINES = frozenset(
+    {"举报", "微信扫码分享", "微信分享", "分享", "职位描述", "立即沟通", "收藏"}
+)
+
+
+def _strip_jd_noise(text: str) -> str:
+    """剥掉 JD 文本**开头连续**的页面 UI 噪声行。
+
+    只剥开头那几行（举报 / 微信扫码分享 / 职位描述 …）；正文里万一再出现同样的词
+    不动。纯函数，便于单测（见 tests/test_finding_jobs_text.py）。
+    """
+    lines = (text or "").split("\n")
+    i = 0
+    while i < len(lines) and lines[i].strip() in _JD_NOISE_LINES:
+        i += 1
+    return "\n".join(lines[i:]).strip()
+
+
+async def get_job_description_by_index(index: int) -> str | None:
+    """点开第 N 个岗位卡（1-indexed），返回右侧 JD 详情面板的文本；失败返回 None。"""
+    log.info("[get_job_description_by_index] index=%d", index)
+    # 全程走 tab.evaluate(JS)，CSS selector + 浏览器内 click 都在 JS 里做完。
+    click_result = await _js_click_at_index(".job-card-box", index)
+    log.info("  点击 .job-card-box[%d]: %s", index, click_result)
+    if not click_result.get("ok"):
+        return None
+
+    jd = await _js_wait_text(".job-detail-body", min_len=50, timeout_s=10)
+    if jd is None:
+        log.info("  10s 内 .job-detail-body 没出现或文本太短")
+        return None
+    jd = _strip_jd_noise(jd)
+    log.info("  JD 长度 %d 字符", len(jd))
+    return jd
+
+
+async def get_job_snapshot_by_index(index: int) -> JobSnapshot | None:
+    """Return a structured snapshot for the Nth card without initiating contact.
+
+    The existing JD extraction remains the single click/read path.  This helper
+    only reads visible card/detail metadata after that path succeeds; it never
+    queries or clicks the contact button.
+    """
+
+    description = await get_job_description_by_index(index)
+    if description is None:
+        return None
+    metadata = await _safe_evaluate(
+        f"""
+        JSON.stringify((() => {{
+          const cards = document.querySelectorAll('.job-card-box');
+          const card = cards[{index - 1}];
+          if (!card) return {{ok: false, reason: 'card_not_found'}};
+          const detail = document.querySelector(
+            '.job-detail-box, .job-detail-container, .job-detail-body'
+          );
+          const norm = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const firstText = (roots, selectors) => {{
+            for (const root of roots) {{
+              if (!root) continue;
+              for (const selector of selectors) {{
+                const node = root.querySelector(selector);
+                const value = norm(node && (node.innerText || node.textContent));
+                if (value) return value;
+              }}
+            }}
+            return '';
+          }};
+          const roots = [detail, card];
+          const link = card.closest('a[href]') || card.querySelector('a[href]');
+          const href = link ? new URL(link.getAttribute('href'), location.origin).href : '';
+          const pathPart = href ? new URL(href).pathname.split('/').filter(Boolean).pop() || '' : '';
+          const idFromUrl = pathPart.replace(/\\.html$/, '');
+          const externalId =
+            card.getAttribute('data-jobid')
+            || card.getAttribute('data-job-id')
+            || (link && (link.getAttribute('data-jobid') || link.getAttribute('data-job-id')))
+            || idFromUrl
+            || '';
+          return {{
+            ok: true,
+            title: firstText(roots, ['.job-name', '[class*="job-name"]']),
+            company: firstText(roots, [
+              '.company-name', '[class*="company-name"]', '.boss-name'
+            ]),
+            location: firstText(roots, [
+              '.job-area', '[class*="job-area"]', '.company-location'
+            ]),
+            salary: firstText(roots, [
+              '.job-salary', '.salary', '[class*="salary"]'
+            ]),
+            externalId,
+            sourceUrl: href,
+            cardText: norm(card.innerText).slice(0, 1000),
+          }};
+        }})())
+        """,
+        timeout=5,
+    )
+    if metadata and not metadata.get("ok"):
+        log.warning("读取岗位结构化字段失败: %s", metadata.get("reason", "unknown"))
+    return JobSnapshot(
+        title=str(metadata.get("title") or ""),
+        company=str(metadata.get("company") or ""),
+        location=str(metadata.get("location") or ""),
+        salary=str(metadata.get("salary") or ""),
+        description=description,
+        external_id=str(metadata.get("externalId") or "") or None,
+        source_url=str(metadata.get("sourceUrl") or "") or None,
+        raw_payload={"card_text": str(metadata.get("cardText") or "")},
+    )
+
+
+async def get_loaded_job_count() -> int:
+    """返回当前 DOM 中已加载的岗位卡数量。"""
+    result = await _safe_evaluate(
+        """
+        JSON.stringify((() => {
+          return {count: document.querySelectorAll('.job-card-box').length};
+        })())
+        """,
+        timeout=5,
+    )
+    return int(result.get("count") or 0)
+
+
+async def scroll_to_load_more_jobs(timeout: float = 8.0) -> bool:
+    """滚动岗位 feed 并等待更多岗位卡出现。
+
+    BOSS 职位页有两种形态：有些滚动左侧岗位列表容器，有些滚动整个页面到底
+    触发 feed 懒加载。页面可能复用固定数量的卡片 DOM，所以左侧列表首卡变化
+    也算进展；window 滚动只有岗位卡数量增加才算成功。
+    """
+    before = await get_loaded_job_count()
+    scroll_result = await _safe_evaluate(
+        """
+        JSON.stringify((() => {
+          const firstCardText = () => {
+            const card = document.querySelector('.job-card-box');
+            return card ? (card.innerText || '').trim().slice(0, 120) : '';
+          };
+          const cards = Array.from(document.querySelectorAll('.job-card-box'));
+          const selectorCandidates = [
+            document.querySelector('.job-list-box'),
+            document.querySelector('.job-list'),
+            document.querySelector('.job-list-container'),
+            document.querySelector('[class*="job-list"]'),
+          ].filter(Boolean);
+          const ancestors = [];
+          let node = cards[0] || null;
+          while (
+            node
+            && node !== document.body
+            && node !== document.documentElement
+          ) {
+            ancestors.push(node);
+            node = node.parentElement;
+          }
+          const seen = new Set();
+          const candidates = [...selectorCandidates, ...ancestors].filter((el) => {
+            if (!cards[0] || !el.contains(cards[0]) || seen.has(el)) return false;
+            seen.add(el);
+            return true;
+          });
+          const scrollable = candidates.find((el) => (
+            el.scrollHeight > el.clientHeight + 20
+            && getComputedStyle(el).overflowY !== 'hidden'
+          ));
+          if (!scrollable) {
+            const target = document.scrollingElement
+              || document.documentElement
+              || document.body;
+            const beforeTop = window.scrollY || target.scrollTop || 0;
+            const beforeFirst = firstCardText();
+            const bottom = Math.max(
+              document.documentElement.scrollHeight,
+              document.body.scrollHeight,
+              target.scrollHeight
+            );
+            window.scrollTo(0, bottom);
+            if (target.scrollTop === beforeTop) {
+              target.scrollTop = bottom;
+            }
+            return {
+              ok: true,
+              target: 'window',
+              beforeTop,
+              afterTop: window.scrollY || target.scrollTop || 0,
+              beforeFirst,
+              afterFirst: firstCardText(),
+            };
+          }
+          const target = scrollable;
+          const beforeTop = target.scrollTop;
+          const beforeFirst = firstCardText();
+          const step = Math.max(
+            600,
+            Math.floor((target.clientHeight || window.innerHeight || 600) * 0.85)
+          );
+          target.dispatchEvent(
+            new WheelEvent(
+              'wheel',
+              {deltaY: step, bubbles: true, cancelable: true}
+            )
+          );
+          if (target.scrollTop === beforeTop && target.scrollBy) {
+            target.scrollBy(0, step);
+          }
+          if (target.scrollTop === beforeTop) {
+            target.scrollTop = beforeTop + step;
+          }
+          const afterTop = target.scrollTop;
+          const afterFirst = firstCardText();
+          return {
+            ok: true,
+            target: 'left-list',
+            targetClass: String(target.className || ''),
+            beforeTop,
+            afterTop,
+            beforeFirst,
+            afterFirst,
+          };
+        })())
+        """,
+        timeout=5,
+    )
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        after = await get_loaded_job_count()
+        if after > before:
+            log.info(
+                "滚动加载更多岗位：%d -> %d（target=%s）",
+                before,
+                after,
+                scroll_result.get("target", ""),
+            )
+            return True
+        if scroll_result.get("target") != "left-list":
+            continue
+        if scroll_result.get("afterTop") != scroll_result.get(
+            "beforeTop"
+        ) or scroll_result.get("afterFirst") != scroll_result.get("beforeFirst"):
+            log.info(
+                "岗位列表已滚动（target=%s，count=%d，DOM 数量未变，按虚拟列表继续）",
+                scroll_result.get("target", ""),
+                before,
+            )
+            return True
+    log.info("滚动后岗位数量和可见内容均未变化：%d", before)
+    return False
+
+
+async def get_text_by_css(selector: str, timeout: float = 5) -> str | None:
+    """通用：返回 CSS 选择器命中元素的 text，找不到返回 None。"""
+    try:
+        el = await _tab.select(selector, timeout=timeout)
+    except Exception:
+        return None
+    return el.text if el else None
+
+
+async def click_by_xpath(xpath: str, timeout: float = 10) -> bool:
+    """通过 xpath 找到元素并点击。成功返回 True。"""
+    els = await _xpath_safe(xpath, timeout=timeout)
+    if not els:
+        return False
+    await els[0].click()
+    return True
+
+
+async def dismiss_greeting_dialog(timeout: float = 5) -> bool:
+    """关掉"立即沟通"后弹出的默认招呼语确认框。
+
+    BOSS 2026-08 改版后，点"立即沟通"会自动发一条默认招呼语，然后弹框提示
+    "已向BOSS发送消息"，需要点"继续沟通"才进入聊天页。
+    如果弹框没出现（旧版 BOSS 或已经跳过），静默返回 False。
+    """
+    try:
+        btn = await _tab.find("继续沟通", best_match=True, timeout=timeout)
+    except Exception:
+        btn = None
+    if btn:
+        await btn.click()
+        log.info("已关闭默认招呼语弹框（点击'继续沟通'）")
+        await asyncio.sleep(1)
+        return True
+    log.debug("未检测到招呼语弹框，跳过")
+    return False
+
+
+async def wait_for_css(selector: str, timeout: float = 50) -> bool:
+    """等 CSS 选择器命中。成功返回 True，超时返回 False。"""
+    try:
+        el = await _tab.select(selector, timeout=timeout)
+    except Exception:
+        return False
+    return el is not None
+
+
+async def send_chat_message(text: str) -> None:
+    """把 text 打进 ``#chat-input`` 然后点发送按钮。"""
+    chat = await _tab.select("#chat-input", timeout=10)
+    if not chat:
+        raise RuntimeError("chat input (#chat-input) 未找到")
+    await chat.send_keys(text)
+    await asyncio.sleep(3)
+    # BOSS 改版后回车不再触发发送，需要点击发送按钮
+    try:
+        send_btn = await _tab.find("发送", best_match=True, timeout=5)
+    except Exception:
+        send_btn = None
+    if send_btn:
+        await send_btn.click()
+        log.info("已点击'发送'按钮")
+    else:
+        log.warning("未找到'发送'按钮，尝试回车发送")
+        await chat.send_keys("\n")
+    await asyncio.sleep(1)
+
+
+async def click_send_resume(timeout: float = 5) -> bool:
+    """在聊天页点击"发简历"按钮。
+
+    发完招呼语后聊天页可能出现"发简历"按钮，点击即可附带简历。
+    按钮不存在时静默返回 False（不影响主流程）。
+    """
+    try:
+        btn = await _tab.find("发简历", best_match=True, timeout=timeout)
+    except Exception:
+        btn = None
+    if btn:
+        await btn.click()
+        log.info("已点击'发简历'")
+        await asyncio.sleep(2)
+        return True
+    log.debug("未找到'发简历'按钮，跳过")
+
+
+async def reload_page() -> None:
+    """刷新当前页面，然后给它一点时间开始重新加载。
+
+    走 ``_safe_evaluate`` 而不是裸 ``_tab.evaluate``：reload 会换掉 renderer
+    进程，pending 的 ``Runtime.evaluate`` 响应可能永远回不来，而 nodriver 的
+    ``Connection.send`` 是没有 timeout 的裸 Future —— 裸调会把整个流程挂死。
+
+    这里只等固定 2 秒（reload 前后 URL 不变，等 URL 稳定没有意义）；真正
+    「加载好了没」由调用方的 ``wait_for_real_job_cards`` 负责。
+    """
+    await _safe_evaluate("JSON.stringify((() => {location.reload(); return {};})())")
+    await asyncio.sleep(2)
+
+
+# 骨架屏占位卡的 innerText 基本是空的（只有几个装饰用的空 span）；真实岗位卡
+# 至少带职位名 + 公司名，远超这个长度。
+_MIN_REAL_CARD_TEXT_LEN = 10
+
+
+def _count_real_job_cards(card_texts: list[str] | None) -> int:
+    """统计有实际内容的岗位卡数量，排除骨架屏空卡。
+
+    纯函数，便于单测（见 tests/test_finding_jobs_text.py）。
+    """
+    return sum(
+        1
+        for text in (card_texts or [])
+        if len((text or "").strip()) >= _MIN_REAL_CARD_TEXT_LEN
+    )
+
+
+async def wait_for_real_job_cards(timeout: float = 30) -> bool:
+    """轮询直到出现**有文字内容**的岗位卡；超时返回 False。
+
+    为什么不用 ``wait_for_css('.job-card-box')``：SPA 没 boot 起来时页面停在
+    「加载中，请稍候」，DOM 里可能已经有骨架屏占位卡，选择器命中但正文全空，
+    主循环随后每一轮都抓不到 JD，最后误报「已到推荐 feed 列表底部」。
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        result = await _safe_evaluate(
+            """
+            JSON.stringify((() => {
+              const cards = document.querySelectorAll('.job-card-box');
+              return {
+                texts: Array.from(cards).map(c => (c.innerText || '').trim()),
+              };
+            })())
+            """,
+            timeout=5,
+        )
+        real = _count_real_job_cards(result.get("texts"))
+        if real:
+            log.info("岗位卡已渲染（有内容的 %d 张）", real)
+            return True
+        await asyncio.sleep(1)
+    return False
+
+
+async def navigate_back() -> None:
+    """``history.back()`` —— 浏览器返回上一页。"""
+    await _tab.evaluate("history.back()")
+    await asyncio.sleep(3)
+
+
+async def return_to_job_list(timeout: float = 12.0, max_attempts: int = 2) -> bool:
+    """尽量回到岗位列表页，并确认列表卡片已恢复。"""
+    for attempt in range(1, max_attempts + 1):
+        await navigate_back()
+        if await wait_for_css(".job-card-box", timeout=timeout):
+            return True
+        log.warning("返回岗位列表第 %d 次失败，继续重试", attempt)
+    return False
+
+
+# Variables（保持向后兼容）
+url = "https://www.zhipin.com/web/geek/job-recommend?ka=header-job-recommend"
+browser_type = "chrome"

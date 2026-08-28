@@ -1,0 +1,10 @@
+{"id": "B01", "title": "AI产品经理（2027校招）", "location": "北京·朝阳区", "description": "负责大模型产品规划，面向2027届毕业生。", "expected_state": "eligible", "note": "标准正例"}
+{"id": "B02", "title": "产品运营经理", "location": "北京·海淀区", "description": "负责社区运营与增长，2027校招。", "expected_state": "filtered", "note": "标题命中排除词「运营」"}
+{"id": "B03", "title": "AI产品经理", "location": "上海·浦东新区", "description": "岗位由乙方劳务派遣至甲方现场办公，2027校招。", "expected_state": "filtered", "note": "内容命中「劳务派遣」"}
+{"id": "B04", "title": "策略产品经理", "location": "杭州·西湖区", "description": "2027校招，负责供给策略。", "expected_state": "filtered", "note": "非目标城市"}
+{"id": "B05", "title": "Java开发工程师", "location": "北京·大兴区", "description": "2027校招后端开发。", "expected_state": "filtered", "note": "非目标产品方向"}
+{"id": "B06", "title": "产品经理实习生", "location": "深圳·南山区", "description": "日常实习，欢迎27届同学。", "expected_state": "filtered", "note": "仅筛校招正式岗，标题为实习"}
+{"id": "B07", "title": "策略产品经理", "location": "北京·昌平区", "description": "要求5-10年经验，负责定价策略。", "expected_state": "needs_review", "note": "无校招标识→降级人工，不硬杀（社招岗有时也收应届）"}
+{"id": "B08", "title": "数据产品经理", "location": "上海·杨浦区", "description": "面向27届应届毕业生，负责指标体系与实验平台。", "expected_state": "eligible", "note": "校招信号在正文（应届）"}
+{"id": "B09", "title": "商业产品经理", "location": "广州·天河区", "description": "我们是甲方自研团队，不是外包公司。2027校园招聘。", "expected_state": "filtered", "note": "已知保守取舍：否定语境的「外包」也会被杀。可接受（宁可漏，不可错触达），如改进需 NLP 否定检测"}
+{"id": "B10", "title": "AI产品经理", "location": "", "description": "工作地点：北京大兴区京东总部。面向2027届校招。", "expected_state": "eligible", "note": "【预期红灯·暴露集成缺陷】capture 层未填 location 字段，城市规则只看 location 不看正文 → 真实数据被整批误杀。修复方向：location 为空时回退到正文找城市或降级 needs_review"}

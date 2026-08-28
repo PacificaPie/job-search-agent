@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+# 注意：regression_snapshot.json 要跟踪——它是判定分布的基线，
+# 变了就说明过滤规则的行为变了，那正是这个文件存在的意义。

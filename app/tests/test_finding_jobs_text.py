@@ -1,0 +1,535 @@
+"""finding_jobs 的纯文本处理（不碰浏览器的部分）。
+
+``_strip_jd_noise`` 剥掉 JD 开头的页面 UI 噪声行（举报 / 微信扫码分享 / 职位描述…），
+这些是 ``.job-detail-body`` 的 innerText 带进来的页面 chrome，不是 JD 正文。
+"""
+
+import asyncio
+import os
+
+from boss_zhipin.website_oper import finding_jobs
+from boss_zhipin.website_oper.finding_jobs import (
+    _apply_sandbox_setting,
+    _env_flag_true,
+    _should_disable_sandbox,
+    _clear_singleton_locks,
+    _count_real_job_cards,
+    _ensure_localhost_bypasses_proxy,
+    _is_logged_in_from_page_state,
+    _start_browser_with_retry,
+    get_loaded_job_count,
+    get_job_snapshot_by_index,
+    return_to_job_list,
+    shutdown,
+    scroll_to_load_more_jobs,
+    _strip_jd_noise,
+)
+
+
+def test_strips_leading_ui_noise():
+    raw = "举报\n微信扫码分享\n职位描述\n\n1、参与 AI 功能模块设计\n岗位要求：本科"
+    out = _strip_jd_noise(raw)
+    assert out.startswith("1、参与 AI 功能模块设计")
+    assert "举报" not in out
+    assert "微信扫码分享" not in out
+
+
+def test_only_strips_leading_run_not_body():
+    # 正文里再出现"职位描述"不该被剥——只剥开头连续的噪声行
+    raw = "举报\n职位描述\n这个职位描述很详细\n岗位要求"
+    assert _strip_jd_noise(raw) == "这个职位描述很详细\n岗位要求"
+
+
+def test_no_noise_unchanged():
+    raw = "1、岗位职责\n2、岗位要求"
+    assert _strip_jd_noise(raw) == raw
+
+
+def test_empty_and_none():
+    assert _strip_jd_noise("") == ""
+    assert _strip_jd_noise(None) == ""
+
+
+def test_env_flag_true_variants(monkeypatch):
+    monkeypatch.setenv("BOSS_NO_SANDBOX", "1")
+    assert _env_flag_true("BOSS_NO_SANDBOX") is True
+
+    monkeypatch.setenv("BOSS_NO_SANDBOX", "TrUe")
+    assert _env_flag_true("BOSS_NO_SANDBOX") is True
+
+    monkeypatch.setenv("BOSS_NO_SANDBOX", "off")
+    assert _env_flag_true("BOSS_NO_SANDBOX") is False
+
+
+def test_should_disable_sandbox_prefers_env_flag(monkeypatch):
+    monkeypatch.setenv("BOSS_NO_SANDBOX", "yes")
+    monkeypatch.delattr(finding_jobs.os, "geteuid", raising=False)
+    assert _should_disable_sandbox() is True
+
+
+def test_should_disable_sandbox_uses_root_detection(monkeypatch):
+    monkeypatch.delenv("BOSS_NO_SANDBOX", raising=False)
+    monkeypatch.setattr(finding_jobs.os, "geteuid", lambda: 0, raising=False)
+    assert _should_disable_sandbox() is True
+
+
+def test_should_disable_sandbox_default_false(monkeypatch):
+    monkeypatch.delenv("BOSS_NO_SANDBOX", raising=False)
+    monkeypatch.setattr(finding_jobs.os, "geteuid", lambda: 1000, raising=False)
+    assert _should_disable_sandbox() is False
+
+
+class _FakeConfig:
+    """替身：只关心 nodriver Config 的 sandbox 属性。"""
+
+    def __init__(self, sandbox: bool = True):
+        self.sandbox = sandbox
+
+
+def test_apply_sandbox_setting_writes_config_when_disabled(monkeypatch):
+    # 关键回归：必须落到 config.sandbox 上。nodriver 的 uc.start(sandbox=...)
+    # 只在不传 config 时才消费该参数，我们一定传 config，走 kwarg 会静默失效。
+    monkeypatch.setenv("BOSS_NO_SANDBOX", "1")
+    config = _FakeConfig(sandbox=True)
+    assert _apply_sandbox_setting(config) is False
+    assert config.sandbox is False
+
+
+def test_apply_sandbox_setting_keeps_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("BOSS_NO_SANDBOX", raising=False)
+    monkeypatch.setattr(finding_jobs.os, "geteuid", lambda: 1000, raising=False)
+    config = _FakeConfig(sandbox=True)
+    assert _apply_sandbox_setting(config) is True
+    assert config.sandbox is True
+
+
+def test_apply_sandbox_setting_does_not_override_upstream_disable(monkeypatch):
+    # nodriver 在 posix + root 下自己会把 sandbox 置 False；我们不该无条件赋 True
+    # 把上游这份自动处理覆盖回去。
+    monkeypatch.delenv("BOSS_NO_SANDBOX", raising=False)
+    monkeypatch.setattr(finding_jobs.os, "geteuid", lambda: 1000, raising=False)
+    config = _FakeConfig(sandbox=False)
+    assert _apply_sandbox_setting(config) is False
+    assert config.sandbox is False
+
+
+def test_counts_only_cards_with_real_text():
+    texts = [
+        "全栈工程师\n25-35K\n某某科技",  # 真实卡
+        "后端开发\n20-30K\n另一家公司",  # 真实卡
+        "",  # 骨架屏空卡
+        "   \n \n ",  # 只有空白，仍算空卡
+    ]
+    assert _count_real_job_cards(texts) == 2
+
+
+def test_skeleton_only_page_counts_zero():
+    # SPA 没 boot 起来时的典型形态：选择器命中一堆卡，但正文全空
+    assert _count_real_job_cards(["", "  ", None]) == 0
+    assert _count_real_job_cards([]) == 0
+    assert _count_real_job_cards(None) == 0
+
+
+def _read_no_proxy() -> str:
+    return os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+
+
+def _set_no_proxy(monkeypatch, value: str | None) -> None:
+    # 必须先清两个变体再设：Windows 的 os.environ 大小写不敏感，先 setenv
+    # 再 delenv 另一个变体会把刚设的值一起删掉。
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.delenv("no_proxy", raising=False)
+    if value is not None:
+        monkeypatch.setenv("no_proxy", value)
+
+
+def test_ensure_localhost_bypasses_proxy_adds_both_hosts(monkeypatch):
+    _set_no_proxy(monkeypatch, None)
+    _ensure_localhost_bypasses_proxy()
+    entries = _read_no_proxy().split(",")
+    assert "127.0.0.1" in entries
+    assert "localhost" in entries
+
+
+def test_ensure_localhost_bypasses_proxy_keeps_existing_entries(monkeypatch):
+    _set_no_proxy(monkeypatch, "corp.example.com,10.0.0.1")
+    _ensure_localhost_bypasses_proxy()
+    entries = _read_no_proxy().split(",")
+    # 用户原有的 bypass 条目一条都不能丢
+    assert "corp.example.com" in entries
+    assert "10.0.0.1" in entries
+    assert "127.0.0.1" in entries
+
+
+def test_ensure_localhost_bypasses_proxy_falls_back_to_uppercase(monkeypatch):
+    # 回归：no_proxy 为空串时要回退读 NO_PROXY。只有 POSIX 分得开这两个变量，
+    # 所以这条在 ubuntu CI 上才真正生效。
+    _set_no_proxy(monkeypatch, "")
+    monkeypatch.setenv("NO_PROXY", "corp.example.com")
+    _ensure_localhost_bypasses_proxy()
+    assert "corp.example.com" in _read_no_proxy().split(",")
+
+
+def test_ensure_localhost_bypasses_proxy_is_noop_when_present(monkeypatch):
+    _set_no_proxy(monkeypatch, "127.0.0.1,localhost")
+    _ensure_localhost_bypasses_proxy()
+    assert _read_no_proxy() == "127.0.0.1,localhost"
+
+
+def test_ensure_localhost_bypasses_proxy_dedupes_case_insensitively(monkeypatch):
+    # LOCALHOST 已经命中（urllib 比对前 .lower()），不该每次启动再追加一条
+    _set_no_proxy(monkeypatch, "LOCALHOST,127.0.0.1")
+    _ensure_localhost_bypasses_proxy()
+    assert _read_no_proxy().lower().split(",").count("localhost") == 1
+
+
+def test_clear_singleton_locks_removes_locks_keeps_cookies(tmp_path):
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket", "Cookies"):
+        (tmp_path / name).write_text("x")
+    _clear_singleton_locks(str(tmp_path))
+    # 三个 Singleton 锁删掉；登录态文件（Cookies）保留
+    assert not (tmp_path / "SingletonLock").exists()
+    assert not (tmp_path / "SingletonCookie").exists()
+    assert not (tmp_path / "SingletonSocket").exists()
+    assert (tmp_path / "Cookies").exists()
+
+
+def test_clear_singleton_locks_missing_ok(tmp_path):
+    _clear_singleton_locks(str(tmp_path))  # 没有锁文件也不报错
+
+
+def test_login_page_url_is_not_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/user/?ka=header-login", {}
+        )
+        is False
+    )
+
+
+def test_jobs_page_with_header_login_is_not_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/jobs",
+            {"headerLoginVisible": True},
+        )
+        is False
+    )
+
+
+def test_jobs_page_with_login_required_text_is_not_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/jobs",
+            {"loginRequiredVisible": True},
+        )
+        is False
+    )
+
+
+def test_jobs_page_without_positive_signals_is_not_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/job-recommend",
+            {
+                "loginWallVisible": False,
+                "headerLoginVisible": False,
+                "loginRequiredVisible": False,
+            },
+        )
+        is False
+    )
+
+
+def test_jobs_page_with_visible_user_signal_is_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/job-recommend",
+            {"userSignalVisible": True, "realJobCardCount": 0},
+        )
+        is True
+    )
+
+
+def test_jobs_page_with_real_job_card_is_logged_in():
+    assert (
+        _is_logged_in_from_page_state(
+            "https://www.zhipin.com/web/geek/job-recommend",
+            {"userSignalVisible": False, "realJobCardCount": 1},
+        )
+        is True
+    )
+
+
+def test_get_loaded_job_count_reads_job_card_count(monkeypatch):
+    async def scenario():
+        async def fake_evaluate(js: str, timeout: float = 10):
+            assert ".job-card-box" in js
+            assert timeout == 5
+            return {"count": 15}
+
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        assert await get_loaded_job_count() == 15
+
+    asyncio.run(scenario())
+
+
+def test_start_browser_waits_for_cdp_then_attaches(monkeypatch):
+    async def scenario():
+        class FakeConfig:
+            browser_executable_path = "/fake/chrome"
+            user_data_dir = "/fake/profile"
+            host = None
+            port = None
+
+            def __call__(self):
+                return [f"--remote-debugging-port={self.port}"]
+
+        class FakeProcess:
+            pid = 123
+            returncode = None
+
+        class FakeBrowser:
+            _process = None
+            _process_pid = None
+
+        process = FakeProcess()
+        browser = FakeBrowser()
+        spawn_calls: list[tuple] = []
+
+        async def fake_spawn(*args, **kwargs):
+            spawn_calls.append((args, kwargs))
+            return process
+
+        async def fake_wait(host: str, port: int, timeout: float = 15.0):
+            assert host == "127.0.0.1"
+            assert port == 45678
+            return True
+
+        async def fake_start(*, config):
+            assert config.host == "127.0.0.1"
+            assert config.port == 45678
+            return browser
+
+        monkeypatch.setattr(finding_jobs, "free_port", lambda: 45678)
+        monkeypatch.setattr(finding_jobs.asyncio, "create_subprocess_exec", fake_spawn)
+        monkeypatch.setattr(finding_jobs, "_wait_for_cdp", fake_wait)
+        monkeypatch.setattr(finding_jobs.uc, "start", fake_start)
+
+        result = await _start_browser_with_retry(FakeConfig(), attempts=1)
+        assert result is browser
+        assert browser._process is process
+        assert browser._process_pid == 123
+        assert spawn_calls[0][0] == ("/fake/chrome", "--remote-debugging-port=45678")
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_requests_graceful_browser_close(monkeypatch):
+    async def scenario():
+        sent: list[object] = []
+
+        class FakeConnection:
+            async def send(self, command):
+                sent.append(command)
+
+        class FakeProcess:
+            async def wait(self):
+                return 0
+
+        class FakeBrowser:
+            connection = FakeConnection()
+            _process = FakeProcess()
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        browser = FakeBrowser()
+        monkeypatch.setattr(finding_jobs, "_browser", browser)
+        monkeypatch.setattr(finding_jobs, "_tab", object())
+
+        await shutdown()
+        assert sent
+        assert browser.stopped is False
+        assert finding_jobs._browser is None
+        assert finding_jobs._tab is None
+
+    asyncio.run(scenario())
+
+
+def test_get_job_snapshot_reads_metadata_after_jd(monkeypatch):
+    async def scenario():
+        async def fake_description(index: int):
+            assert index == 2
+            return "Build useful AI products"
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            assert "job-card-box" in js
+            assert "op-btn-chat" not in js
+            assert ".boss-name" in js
+            assert ".company-location" in js
+            assert ".job-salary" in js
+            assert timeout == 5
+            return {
+                "ok": True,
+                "title": "AI Product Manager",
+                "company": "Example",
+                "location": "Shanghai",
+                "salary": "20-30K",
+                "externalId": "abc123",
+                "sourceUrl": "https://www.zhipin.com/job_detail/abc123.html",
+                "cardText": "AI Product Manager Example",
+            }
+
+        monkeypatch.setattr(
+            finding_jobs, "get_job_description_by_index", fake_description
+        )
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        snapshot = await get_job_snapshot_by_index(2)
+        assert snapshot is not None
+        assert snapshot.title == "AI Product Manager"
+        assert snapshot.company == "Example"
+        assert snapshot.description == "Build useful AI products"
+        assert snapshot.external_id == "abc123"
+        assert snapshot.raw_payload == {"card_text": "AI Product Manager Example"}
+
+    asyncio.run(scenario())
+
+
+def test_scroll_to_load_more_jobs_returns_true_when_card_count_grows(monkeypatch):
+    async def scenario():
+        counts = iter([15, 30])
+        evaluate_calls: list[str] = []
+
+        async def fake_count():
+            return next(counts)
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            evaluate_calls.append(js)
+            return {
+                "target": "left-list",
+                "beforeTop": 0,
+                "afterTop": 700,
+                "beforeFirst": "old",
+                "afterFirst": "old",
+            }
+
+        async def fake_sleep(delay: float):
+            return None
+
+        monkeypatch.setattr(finding_jobs, "get_loaded_job_count", fake_count)
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        monkeypatch.setattr(finding_jobs.asyncio, "sleep", fake_sleep)
+
+        assert await scroll_to_load_more_jobs(timeout=1.0) is True
+        assert evaluate_calls
+        assert "job-list-box" in evaluate_calls[0]
+
+    asyncio.run(scenario())
+
+
+def test_scroll_to_load_more_jobs_treats_visible_card_change_as_progress(monkeypatch):
+    async def scenario():
+        async def fake_count():
+            return 15
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            return {
+                "target": "left-list",
+                "beforeTop": 0,
+                "afterTop": 700,
+                "beforeFirst": "old card",
+                "afterFirst": "new card",
+            }
+
+        async def fake_sleep(delay: float):
+            return None
+
+        monkeypatch.setattr(finding_jobs, "get_loaded_job_count", fake_count)
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        monkeypatch.setattr(finding_jobs.asyncio, "sleep", fake_sleep)
+
+        assert await scroll_to_load_more_jobs(timeout=1.0) is True
+
+    asyncio.run(scenario())
+
+def test_scroll_to_load_more_jobs_ignores_window_scroll(monkeypatch):
+    async def scenario():
+        async def fake_count():
+            return 15
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            return {
+                "ok": True,
+                "target": "window",
+                "beforeTop": 0,
+                "afterTop": 700,
+                "beforeFirst": "old card",
+                "afterFirst": "old card",
+            }
+
+        async def fake_sleep(delay: float):
+            return None
+
+        monkeypatch.setattr(finding_jobs, "get_loaded_job_count", fake_count)
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        monkeypatch.setattr(finding_jobs.asyncio, "sleep", fake_sleep)
+
+        assert await scroll_to_load_more_jobs(timeout=1.0) is False
+
+    asyncio.run(scenario())
+
+
+def test_scroll_to_load_more_jobs_accepts_window_scroll_when_count_grows(monkeypatch):
+    async def scenario():
+        counts = iter([15, 30])
+        evaluate_calls: list[str] = []
+
+        async def fake_count():
+            return next(counts)
+
+        async def fake_evaluate(js: str, timeout: float = 10):
+            evaluate_calls.append(js)
+            return {
+                "ok": True,
+                "target": "window",
+                "beforeTop": 0,
+                "afterTop": 1500,
+                "beforeFirst": "old card",
+                "afterFirst": "old card",
+            }
+
+        async def fake_sleep(delay: float):
+            return None
+
+        monkeypatch.setattr(finding_jobs, "get_loaded_job_count", fake_count)
+        monkeypatch.setattr(finding_jobs, "_safe_evaluate", fake_evaluate)
+        monkeypatch.setattr(finding_jobs.asyncio, "sleep", fake_sleep)
+
+        assert await scroll_to_load_more_jobs(timeout=1.0) is True
+        assert "window.scrollTo" in evaluate_calls[0]
+
+    asyncio.run(scenario())
+
+
+def test_return_to_job_list_retries_until_cards_are_visible(monkeypatch):
+    async def scenario():
+        back_calls: list[bool] = []
+        visible_results = iter([False, True])
+
+        async def fake_back():
+            back_calls.append(True)
+
+        async def fake_wait(selector: str, timeout: float = 50):
+            assert selector == ".job-card-box"
+            assert timeout == 12.0
+            return next(visible_results)
+
+        monkeypatch.setattr(finding_jobs, "navigate_back", fake_back)
+        monkeypatch.setattr(finding_jobs, "wait_for_css", fake_wait)
+
+        assert await return_to_job_list() is True
+        assert len(back_calls) == 2
+
+    asyncio.run(scenario())

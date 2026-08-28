@@ -1,0 +1,10 @@
+{"id": "L01", "title": "AI Product Manager, New Grad", "location": "New York, NY", "description": "Class of 2027 welcome. H-1B sponsorship available.", "expected_state": "eligible", "note": "标准正例"}
+{"id": "L02", "title": "Senior AI Product Manager", "location": "New York, NY", "description": "2027 start. Sponsorship available.", "expected_state": "filtered", "note": "资深级别标题"}
+{"id": "L03", "title": "AI Product Manager", "location": "San Francisco, CA", "description": "Requires 5+ years of product experience. 2027.", "expected_state": "filtered", "note": "经验年限要求"}
+{"id": "L04", "title": "GenAI Product Manager", "location": "Boston, MA", "description": "2027 new grad program. We are unable to sponsor visas.", "expected_state": "filtered", "note": "明确不支持 Sponsorship"}
+{"id": "L05", "title": "AI Product Manager", "location": "Austin, TX", "description": "New grad program, visa sponsorship available.", "expected_state": "needs_review", "note": "缺 2027 明确标识"}
+{"id": "L06", "title": "Machine Learning Product Manager", "location": "Washington, DC", "description": "2027 university graduate cohort.", "expected_state": "needs_review", "note": "Sponsorship 未说明→人工核对"}
+{"id": "L07", "title": "AI Product Manager", "location": "Seattle, WA", "description": "2027 new grad. Sponsorship available.", "expected_state": "filtered", "note": "非目标城市"}
+{"id": "L08", "title": "Product Manager - Foundation Models", "location": "New York, NY", "description": "2027 new grad. Immigration sponsorship offered to qualified candidates. Work on foundation model evaluation.", "expected_state": "eligible", "note": "语义兜底：标题含 PM + 正文 AI 上下文"}
+{"id": "L09", "title": "Marketing Manager", "location": "New York, NY", "description": "2027 new grad, AI industry.", "expected_state": "filtered", "note": "非产品岗"}
+{"id": "L10", "title": "AI Product Manager, Early Career", "location": "New York, NY", "description": "0-2 years experience required. Class of 2027. H1B sponsorship available. You will be mentored by leaders with 10+ years of experience.", "expected_state": "eligible", "note": "【预期红灯·暴露误杀】经验正则命中的是导师背景描述「10+ years」而非岗位要求。修复方向：正则限定在 requirements 语境或加否定窗口"}

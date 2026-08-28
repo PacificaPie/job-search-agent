@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "v2/**"]
+  pull_request:
+
+jobs:
+  app-and-evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: latest
+
+      - name: Install Python and app dependencies
+        working-directory: app
+        run: |
+          uv python install 3.13
+          uv sync --frozen
+
+      - name: Run app tests
+        working-directory: app
+        env:
+          LLM_API_KEY: test-fake-key
+          LLM_MODEL: test-fake-model
+          BOSS_RETRY_BASE_DELAY: "0.01"
+          BOSS_RETRY_MAX_DELAY: "0.05"
+        run: uv run pytest tests/ -q --tb=short
+
+      - name: Run offline Campaign and filter evals
+        working-directory: evals
+        env:
+          REACHOUT_APP_PATH: ${{ github.workspace }}/app
+        run: python3 run_evals.py
+
+  no-leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject sensitive tracked files
+        shell: bash
+        run: |
+          if git ls-files | grep -qE '(^|/)(\.env|assistant\.json)$'; then
+            echo "Sensitive environment or assistant file is tracked"
+            exit 1
+          fi
+          if git ls-files | grep -qE '(^|/)(chrome_profile|vectorstores|logs|data)/'; then
+            echo "Sensitive runtime directory is tracked"
+            exit 1
+          fi
+          if git ls-files | grep -qE '(^|/)resume/.*\.(pdf|docx?)$'; then
+            echo "Private resume artifact is tracked"
+            exit 1
+          fi
