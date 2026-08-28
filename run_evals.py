@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Reachout 测评 harness。
 
-L1（确定性过滤）：离线可跑，python3.10+ 均可（内置 StrEnum shim）。
+L0/L1（Campaign 契约 + 确定性过滤）：离线可跑，python3.10+ 均可（内置 StrEnum shim）。
 L2（匹配打分）/ L3（草稿质量）：需要 OpenAI 兼容端点，设 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL。
 
 用法：
-  python3 run_evals.py                 # 跑 L1 golden 集
+  python3 run_evals.py                 # 跑 L0/L1 golden 集
   python3 run_evals.py --regression    # 用真实 DB + 真实用户偏好跑全量回归快照
+  python3 run_evals.py --update-regression  # 人工确认后显式更新分布快照
   python3 run_evals.py --l2            # 跑 L2 打分测评（需 API key）
 """
 from __future__ import annotations
@@ -66,10 +67,16 @@ def default_db_path() -> Path:
     return Path(configured).expanduser() if configured else APP / "data" / "reachout.db"
 
 
+from boss_zhipin.domain.campaign import campaign_spec_for_platform  # noqa: E402
 from boss_zhipin.domain.job_filter import JobFilterConfig, evaluate_job_rules  # noqa: E402
 from boss_zhipin.domain.linkedin_filter import (  # noqa: E402
     DEFAULT_LINKEDIN_FILTER,
     evaluate_linkedin_job_rules,
+)
+from boss_zhipin.models.match_scoring import (  # noqa: E402
+    build_match_scoring_prompt,
+    match_scoring_policy,
+    parse_match_scoring_response,
 )
 
 
@@ -109,8 +116,52 @@ def run_golden(name: str, cases: list[dict], fn) -> tuple[int, int, list[str]]:
     return passed, len(cases), failures
 
 
+def run_campaign_contract() -> tuple[int, int, list[str]]:
+    cases = load_jsonl(HERE / "golden" / "campaign_contract.jsonl")
+    passed, failures = 0, []
+    for case in cases:
+        try:
+            campaign = campaign_spec_for_platform(case["platform"])
+        except ValueError as exc:
+            expected_error = case.get("expected_error")
+            if expected_error and expected_error in str(exc):
+                passed += 1
+            else:
+                failures.append(
+                    f"  ✗ [{case['id']}] 未预期错误 {exc} | 备注 {case.get('note', '')}"
+                )
+            continue
+
+        expected_error = case.get("expected_error")
+        got = {
+            "campaign_key": campaign.campaign_key,
+            "action_strategy": campaign.action_strategy.value,
+            "requires_generated_materials": campaign.requires_generated_materials,
+        }
+        expected = {
+            "campaign_key": case.get("expected_campaign_key"),
+            "action_strategy": case.get("expected_action_strategy"),
+            "requires_generated_materials": case.get(
+                "expected_requires_generated_materials"
+            ),
+        }
+        if not expected_error and got == expected:
+            passed += 1
+        else:
+            failures.append(
+                f"  ✗ [{case['id']}] 期望 {expected} 实际 {got} | "
+                f"备注 {case.get('note', '')}"
+            )
+    return passed, len(cases), failures
+
+
 def cmd_l1() -> int:
-    total_pass = total = 0
+    contract_pass, contract_total, contract_failures = run_campaign_contract()
+    print(f"[campaign_contract.jsonl] {contract_pass}/{contract_total} 通过")
+    for failure in contract_failures:
+        print(failure)
+
+    filter_pass = filter_total = 0
     for fname, fn in (
         ("boss_filter.jsonl", lambda **kw: evaluate_job_rules(config=BOSS_CFG, **kw)),
         (
@@ -120,16 +171,20 @@ def cmd_l1() -> int:
     ):
         cases = load_jsonl(HERE / "golden" / fname)
         p, n, fails = run_golden(fname, cases, fn)
-        total_pass += p
-        total += n
+        filter_pass += p
+        filter_total += n
         print(f"[{fname}] {p}/{n} 通过")
         for f in fails:
             print(f)
-    print(f"\nL1 合计：{total_pass}/{total}")
+    print(f"\nL0 Campaign 契约：{contract_pass}/{contract_total}")
+    print(f"L1 过滤合计：{filter_pass}/{filter_total}")
+    total_pass = contract_pass + filter_pass
+    total = contract_total + filter_total
+    print(f"离线合计：{total_pass}/{total}")
     return 0 if total_pass == total else 1
 
 
-def cmd_regression() -> int:
+def cmd_regression(*, update_snapshot: bool = False) -> int:
     db = default_db_path()
     if not db.exists():
         raise SystemExit(
@@ -140,6 +195,7 @@ def cmd_regression() -> int:
     prefs = load_user_prefs(db)
     conn = sqlite3.connect(db)
     dist: dict[str, dict[str, int]] = {}
+    campaign_dist: dict[str, dict[str, int]] = {}
     reason_top: dict[str, dict[str, int]] = {}
     for platform, title, location, desc in conn.execute(
         "select platform, title, location, description from jobs"
@@ -150,26 +206,42 @@ def cmd_regression() -> int:
             m = evaluate_job_rules(title=title, location=location, description=desc, config=prefs)
         dist.setdefault(platform, {}).setdefault(str(m.state), 0)
         dist[platform][str(m.state)] += 1
+        try:
+            campaign_key = campaign_spec_for_platform(platform).campaign_key
+        except ValueError:
+            campaign_key = "unassigned"
+        campaign_dist.setdefault(campaign_key, {}).setdefault(str(m.state), 0)
+        campaign_dist[campaign_key][str(m.state)] += 1
         key = m.reasons[0] if m.reasons else "?"
         reason_top.setdefault(platform, {}).setdefault(key, 0)
         reason_top[platform][key] += 1
     conn.close()
     print("=== 真实 DB 全量回归（判定分布） ===")
     print(json.dumps(dist, ensure_ascii=False, indent=2))
+    print("=== 按 Campaign 路由后的判定分布 ===")
+    print(json.dumps(campaign_dist, ensure_ascii=False, indent=2))
     print("=== 首要理由 Top ===")
     for platform, reasons in reason_top.items():
         top = sorted(reasons.items(), key=lambda kv: -kv[1])[:6]
         print(platform, json.dumps(dict(top), ensure_ascii=False, indent=2))
     snapshot = HERE / "regression_snapshot.json"
-    baseline = json.loads(snapshot.read_text()) if snapshot.exists() else None
-    snapshot.write_text(json.dumps(dist, ensure_ascii=False, indent=2))
-    if baseline is not None and baseline != dist:
+    current = {"by_platform": dist, "by_campaign": campaign_dist}
+    if update_snapshot:
+        snapshot.write_text(json.dumps(current, ensure_ascii=False, indent=2) + "\n")
+        print(f"\n已显式更新回归快照：{snapshot}")
+        return 0
+    if not snapshot.exists():
+        print("\n⚠️ 回归快照不存在；人工确认分布后用 --update-regression 创建")
+        return 1
+    baseline = json.loads(snapshot.read_text())
+    if baseline != current:
         print("\n⚠️ 判定分布相对上次快照发生变化，检查是否为预期改动")
+        print("确认无误后再显式运行：python3 run_evals.py --update-regression")
         return 1
     return 0
 
 
-_RESUME_REF_RE = re.compile(r"^同\s*(S\d+)$")
+_RESUME_REF_RE = re.compile(r"^同\s*([A-Z]\d+)$")
 
 
 def resolve_resume_refs(cases: list[dict]) -> None:
@@ -190,7 +262,7 @@ def resolve_resume_refs(cases: list[dict]) -> None:
         case["resume_summary"] = target["resume_summary"]
 
 
-def cmd_l2() -> int:
+def cmd_l2(*, case_ids: set[str] | None = None) -> int:
     key = os.environ.get("LLM_API_KEY")
     if not key:
         print("L2 需要 LLM_API_KEY（OpenAI 兼容端点）。当前未配置，跳过。")
@@ -206,10 +278,21 @@ def cmd_l2() -> int:
     model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
     cases = load_jsonl(HERE / "golden" / "match_scoring.jsonl")
     resolve_resume_refs(cases)
-    rubric = (HERE / "rubrics" / "match_scoring_prompt.md").read_text()
-    errors, band_hits = [], 0
+    if case_ids:
+        known_ids = {case["id"] for case in cases}
+        unknown = case_ids - known_ids
+        if unknown:
+            raise SystemExit(f"未知 L2 case：{', '.join(sorted(unknown))}")
+        cases = [case for case in cases if case["id"] in case_ids]
+    errors, band_hits, coverage_failures = [], 0, 0
     for case in cases:
-        prompt = rubric.format(jd=case["jd"], resume=case["resume_summary"])
+        campaign_key = case["campaign_key"]
+        policy = match_scoring_policy(campaign_key)
+        prompt = build_match_scoring_prompt(
+            job_description=case["jd"],
+            resume_text=case["resume_summary"],
+            campaign_key=campaign_key,
+        )
         body = json.dumps(
             {
                 "model": model,
@@ -222,10 +305,16 @@ def cmd_l2() -> int:
             data=body,
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            content = json.load(resp)["choices"][0]["message"]["content"]
         try:
-            got = json.loads(content.strip().removeprefix("```json").removesuffix("```"))
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                content = json.load(resp)["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            message = f"[{case['id']}] API 调用失败: {type(exc).__name__}: {exc}"
+            errors.append(message)
+            print(f"✗ {message}")
+            continue
+        try:
+            got = parse_match_scoring_response(content)
             score = float(got["score"])
         except Exception as exc:  # noqa: BLE001
             errors.append(f"[{case['id']}] 输出不可解析: {exc}")
@@ -234,15 +323,28 @@ def cmd_l2() -> int:
         ok = lo <= score <= hi
         band_hits += ok
         flag = "✓" if ok else "✗"
-        print(f"{flag} [{case['id']}] score={score} 期望带 [{lo},{hi}] | {case['title']}")
-        must = case.get("must_mention", [])
-        missing = [m for m in must if m not in json.dumps(got, ensure_ascii=False)]
+        print(
+            f"{flag} [{case['id']}] {campaign_key}/{policy.prompt_version} "
+            f"score={score} 期望带 [{lo},{hi}] | {case['title']}"
+        )
+        haystack = json.dumps(got, ensure_ascii=False).casefold()
+        required_groups = [[term] for term in case.get("must_mention", [])]
+        required_groups.extend(case.get("must_mention_any", []))
+        missing = [
+            alternatives
+            for alternatives in required_groups
+            if not any(str(term).casefold() in haystack for term in alternatives)
+        ]
         if missing:
+            coverage_failures += 1
             print(f"   ⚠️ 理由未覆盖关键点: {missing}")
-    print(f"\nL2 band 命中：{band_hits}/{len(cases)}；解析失败 {len(errors)}")
+    print(
+        f"\nL2 band 命中：{band_hits}/{len(cases)}；"
+        f"关键点遗漏 {coverage_failures}；调用/解析失败 {len(errors)}"
+    )
     for e in errors:
         print(" ", e)
-    return 0 if band_hits == len(cases) and not errors else 1
+    return 0 if band_hits == len(cases) and not errors and not coverage_failures else 1
 
 
 if __name__ == "__main__":
@@ -259,10 +361,17 @@ if __name__ == "__main__":
     )
     ap = argparse.ArgumentParser()
     ap.add_argument("--regression", action="store_true")
+    ap.add_argument("--update-regression", action="store_true")
     ap.add_argument("--l2", action="store_true")
+    ap.add_argument(
+        "--case",
+        action="append",
+        default=[],
+        help="只跑指定 L2 case，可重复传入，如 --case G01 --case G02",
+    )
     args = ap.parse_args()
-    if args.regression:
-        raise SystemExit(cmd_regression())
+    if args.regression or args.update_regression:
+        raise SystemExit(cmd_regression(update_snapshot=args.update_regression))
     if args.l2:
-        raise SystemExit(cmd_l2())
+        raise SystemExit(cmd_l2(case_ids=set(args.case) or None))
     raise SystemExit(cmd_l1())

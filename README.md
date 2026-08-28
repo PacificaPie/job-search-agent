@@ -2,26 +2,31 @@
 
 > 建于 2026-08-27。设计原则：测评先于重构——任何 pipeline 改动必须先过这里。
 
-## 为什么分三层
+## 为什么分层
 
 业界对 agent 的测评通用做法是按「确定性 → 单步 LLM → 端到端」分层，每层用不同手段：
 
 | 层 | 被测对象 | 方法 | 状态 |
 |---|---|---|---|
+| **L0 契约** | 平台 → Campaign → action strategy | Golden 精确断言；未知来源必须显式失败 | ✅ 4/4 |
 | **L1 过滤** | `domain/job_filter.py`、`domain/linkedin_filter.py` | Golden set 精确断言 + 真实 DB 全量回归快照 | ✅ 20/20 |
-| **L2 打分** | LLM 匹配评分 | 人工标注分数带 + 关键点覆盖检查 | ✅ 7/7（claude-sonnet-4-6） |
-| **L3 草稿** | 招呼语/触达文案生成 | LLM-as-judge + 一票否决制 rubric | ⏸ rubric 已写，harness 未接 |
+| **L2 打分** | Campaign-specific LLM 匹配评分 | 人工/合成分数带 + 关键点覆盖；直接 import app 生产 prompt/parser | ✅ 国内 7/7 + 海外 4/4 |
+| **L3 生成物** | 海外定制简历 / outreach | LLM-as-judge + 事实溯源 + 一票否决制 rubric | ⏸ rubric 已写，harness 未接 |
 | （远期）E2E | 全链路 | 北极星指标：回复率/约面率，从 applications 表自动统计 | 待投递数据积累 |
 
 ## 怎么跑
 
 ```bash
 cd evals
-python3 run_evals.py               # L1 golden
-python3 run_evals.py --regression  # 真实 DB 回归（分布变化会报警）
+python3 run_evals.py               # L0 Campaign 契约 + L1 过滤，当前 24/24
+python3 run_evals.py --regression  # 真实 DB 回归，只比较快照，不会自动覆盖
+python3 run_evals.py --update-regression  # 仅在人工解释分布变化后显式更新快照
 
 # L2：从 app/.env 读端点即可（base_url 带不带 /v1 都兼容）
 set -a && . ../app/.env && set +a && ../app/.venv/bin/python run_evals.py --l2
+
+# 端点偶发 503 时只重跑失败 case，避免重复付费
+../app/.venv/bin/python run_evals.py --l2 --case G02 --case G04
 ```
 
 > ⚠️ 用 `../app/.venv/bin/python` 而不是系统 `python3`：机器上的 anaconda python
@@ -59,15 +64,42 @@ set -a && . ../app/.env && set +a && ../app/.venv/bin/python run_evals.py --l2
    - 修完连跑两次都是 **7/7 band 命中、0 解析失败**，must_mention 关键点全覆盖。
      分数很稳（S01 82、S03 91、S06 22），说明 rubric 的硬规则（外包 ≤40、硬门槛 ≤45）真的在起作用。
 
-5. **L3 的预期结论**：现有 4 条 drafts 是同一条固定招呼语，rubric 的「岗位针对性」维度必得 0 分。
-   这是「固定文案 → 按 JD 生成」是否值得投入的量化依据。harness 还没接 `--l3`。
+5. **Campaign 架构进入 L0 与回归快照**：`campaign_contract.jsonl` 固定平台路由、
+   action strategy 和是否需要生成材料。真实 DB 回归同时输出 `by_platform` 与
+   `by_campaign`，未知平台进入 `unassigned`，不能静默混队列。
+
+6. **L2 prompt 漂移已结构性消除**：生产 prompt 与 parser 的唯一来源是
+   `app/src/boss_zhipin/models/match_scoring.py`；harness 直接 import，不再读取一份
+   evals 私有 prompt。国内/海外各有版本号，写入 evaluation 便于回放。
+
+7. **BOSS 固定招呼语不再作为 L3 生成任务**：L3 优先评海外定制简历和英文
+   outreach。BOSS 的测评重点是路由正确、无逐岗位生成、无系统自动发送。
+
+8. **海外 L2 首批 4 条已跑通**（claude-sonnet-4-6）：标准正例 82、明确不支持
+   Sponsorship 28、Senior + 5 年门槛 38、签证未说明 62，全部落在标注 band，
+   硬门槛理由覆盖无遗漏。端点期间多次 503/断连，因此 harness 增加 `--case` 定点
+   重跑和逐 case 错误隔离；网络失败会让本轮失败，但不会中断后续 case。
 
 ## 标注约定
 
 - golden 标签编码**期望行为**而非当前实现——红灯是功能不是事故。
 - 每条 case 带 `note` 说明设计意图；已知保守取舍（如 B09 否定语境）标 green 但注明。
-- L2 分数带来自 2026-08-20 的 5 条人工标注（codex-manual-resume-review-v1），扩充时保持同一
-  resume_summary 以保证可比——文件里写 `"resume_summary": "同 S01"` 即可，harness 会自动解析。
+- L2 国内分数带来自 2026-08-20 的 5 条人工标注，海外首批为 Campaign 硬门槛合成集；
+  扩充时必须填写 `campaign_key`。同一 Campaign 内保持同一 resume summary 以保证可比，
+  文件里可写 `"resume_summary": "同 S01"` / `"同 G01"`，harness 会自动解析。
+
+## 同步维护协议
+
+| app 改动 | 必须同步的 eval |
+|---|---|
+| 新增/修改来源平台或 Campaign action strategy | `golden/campaign_contract.jsonl`（L0） |
+| 修改确定性召回/过滤规则 | 对应 L1 golden；再跑 `--regression`，解释分布变化 |
+| 修改匹配 prompt、parser 或硬门槛 | 改 app 的 `models/match_scoring.py` + 对应 Campaign L2 case；禁止在 evals 复制 prompt |
+| 修改海外简历/outreach 生成 | 先补 L3 case/rubric，再改生成链 |
+| 修改 applications 状态或反馈定义 | 更新 E2E 指标口径与历史兼容说明 |
+
+Golden 标签不能为了变绿而改。只有产品期望确实变化时才修改标签，并在 case `note`
+和变更记录中说明原因。回归快照也不再自动写入，必须使用 `--update-regression` 显式确认。
 
 ## 这是一个独立的仓
 

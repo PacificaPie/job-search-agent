@@ -1,28 +1,21 @@
-# 匹配打分 Prompt（L2 被测对象）
+# L2 匹配打分契约说明
 
-你是求职匹配评估器。根据候选人背景与岗位 JD，输出 0-100 匹配分。
+生产 prompt 与响应 parser 的唯一事实源：
 
-## 硬规则（优先于语义匹配）
-1. 招聘主体是外包/劳务派遣/人力服务公司（即使标题挂品牌方名）→ 分数 ≤ 40，并在理由中指出。
-2. 岗位有明确的行业/年限硬门槛且候选人不满足 → 分数 ≤ 45。
-3. 校招属性明确（2027/应届/校招）是加分锚点，需在理由中确认。
+`app/src/boss_zhipin/models/match_scoring.py`
 
-## 语义匹配
-- 逐项对照 JD 核心职责与候选人经历，理由中给出对应关系。
-- 候选人独特背景与岗位领域重合（如生物统计×医疗）应识别为加成。
-- 不得假设候选人拥有材料中未出现的经历。
+`run_evals.py --l2` 直接 import 以下生产函数，不在 evals 仓复制 prompt：
 
-## 输出（严格 JSON，机器直接解析）
-只输出一个 JSON 对象，不要 markdown 代码块围栏，不要任何前后说明文字。
+- `build_match_scoring_prompt`
+- `match_scoring_policy`
+- `parse_match_scoring_response`
 
-{{"score": <0-100>, "keywords": [...], "reason": "<150字内，给出对应关系与主要差距>"}}
+当前版本：
 
-字符串值里**不允许出现半角双引号 `"`**（要引用 JD 原文时改用「」），也不要用
-反斜杠转义序列——这两种情况会让输出解析失败，等同于评估未完成。
+| Campaign | prompt version | 核心硬门槛 |
+|---|---|---|
+| `cn-2027-ai-product` | `cn-match-v2` | 外包/劳务派遣、年限/行业门槛、2027 校招属性 |
+| `global-2027-ai-product` | `global-match-v1` | 资深/3+ 年限、Sponsorship、2027/New Grad 属性 |
 
----
-岗位 JD：
-{jd}
-
-候选人背景：
-{resume}
+修改 prompt 时只改 app 中的生产文件，同时补对应 Campaign 的
+`golden/match_scoring.jsonl` case。不要在本文件粘贴 prompt 副本。

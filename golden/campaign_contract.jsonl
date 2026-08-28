@@ -1,0 +1,4 @@
+{"id":"C01","platform":"boss_zhipin","expected_campaign_key":"cn-2027-ai-product","expected_action_strategy":"boss_fixed_greeting","expected_requires_generated_materials":false,"note":"BOSS 只负责筛选和引导本人打开岗位；平台固定招呼语，不生成逐岗位材料"}
+{"id":"C02","platform":"linkedin","expected_campaign_key":"global-2027-ai-product","expected_action_strategy":"tailored_application","expected_requires_generated_materials":true,"note":"海外 LinkedIn 岗位进入定制简历/outreach 路线"}
+{"id":"C03","platform":"company_site","expected_campaign_key":"global-2027-ai-product","expected_action_strategy":"tailored_application","expected_requires_generated_materials":true,"note":"公司官网与 LinkedIn 共享海外 Campaign 生命周期，但保留来源字段"}
+{"id":"C04","platform":"unknown_board","expected_error":"unsupported campaign source platform","note":"新来源必须显式归类，禁止静默混入某条 Campaign"}

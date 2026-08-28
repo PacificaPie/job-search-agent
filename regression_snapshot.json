@@ -1,11 +1,24 @@
 {
-  "boss_zhipin": {
-    "filtered": 46,
-    "needs_review": 44,
-    "eligible": 5
+  "by_platform": {
+    "boss_zhipin": {
+      "filtered": 46,
+      "needs_review": 44,
+      "eligible": 5
+    },
+    "linkedin": {
+      "filtered": 4,
+      "needs_review": 1
+    }
   },
-  "linkedin": {
-    "filtered": 4,
-    "needs_review": 1
+  "by_campaign": {
+    "cn-2027-ai-product": {
+      "filtered": 46,
+      "needs_review": 44,
+      "eligible": 5
+    },
+    "global-2027-ai-product": {
+      "filtered": 4,
+      "needs_review": 1
+    }
   }
 }
