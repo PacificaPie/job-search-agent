@@ -1,0 +1,11 @@
+{
+  "boss_zhipin": {
+    "filtered": 46,
+    "needs_review": 44,
+    "eligible": 5
+  },
+  "linkedin": {
+    "filtered": 4,
+    "needs_review": 1
+  }
+}
