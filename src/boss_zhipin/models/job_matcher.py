@@ -23,6 +23,12 @@ from boss_zhipin.models.llm import (
     _completion_content,
     current_provider_label,
 )
+from boss_zhipin.models.match_scoring import (
+    build_match_scoring_prompt,
+    match_scoring_policy,
+    parse_match_scoring_response,
+)
+from boss_zhipin.domain.campaign import CHINA_CAMPUS_CAMPAIGN
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -148,6 +154,8 @@ def llm_match_score(
     job_description: str,
     resume_text: str,
     matched_keywords: list[str],
+    *,
+    campaign_key: str = CHINA_CAMPUS_CAMPAIGN.campaign_key,
 ) -> tuple[int, str, bool]:
     """第二层：LLM 精筛。评估简历与职位的匹配度。
 
@@ -166,28 +174,12 @@ def llm_match_score(
         log.warning("LLM 未配置好，跳过 LLM 评分：%s", e)
         return 100, "无法评分（LLM 未配置）", True
     prov = current_provider_label()
-
-    prompt = f"""你是一位专业的招聘匹配分析师。请评估以下简历与职位描述的匹配程度。
-
-## 职位描述
-{job_description}
-
-## 简历内容
-{resume_text[:2000]}
-
-## 已匹配的关键词
-{', '.join(matched_keywords)}
-
-## 要求
-请严格按以下格式回复，不要包含任何其他内容：
-分数: [0-100的整数]
-理由: [一句话说明，不超过50字]
-
-评分标准：
-- 90-100: 技能和经验高度匹配，非常适合
-- 70-89: 大部分技能匹配，值得投递
-- 50-69: 部分匹配，可以尝试
-- 0-49: 匹配度低，不建议投递"""
+    prompt = build_match_scoring_prompt(
+        job_description=job_description,
+        resume_text=resume_text[:2000],
+        matched_keywords=matched_keywords,
+        campaign_key=campaign_key,
+    )
 
     # _call_chat_completion 自带指数退避重试；评分调用跟招呼语生成一样
     # 记 telemetry，不然每个职位多出来的这次调用成本不进 llm_calls.jsonl
@@ -220,20 +212,14 @@ def llm_match_score(
         ok=True,
     )
 
-    # 冒号同时容忍 ASCII ":" 和全角 "："——中文 LLM（尤其 DeepSeek）即便 prompt
-    # 给的是 ASCII 冒号，回复也常用全角。只认 ASCII 会让解析静默失败 → fail-open
-    # 恒返 100 → 第二层 LLM 过滤被悄悄绕过。
-    score_match = re.search(r"分数[:：]\s*(\d+)", content)
-    if not score_match:
-        # LLM 没按格式回复时同样 fail-open；fail-closed（按 0 分算）
-        # 会把职位静默跳过，且日志里看不出原因
+    try:
+        parsed = parse_match_scoring_response(content)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        # LLM 没按被测 JSON 契约回复时 fail-open；fail-closed（按 0 分算）会把职位
+        # 静默跳过。degraded=True 让审核台能明确提示评分未完成。
         log.warning("LLM 评分回复解析失败，按 100 放行。回复内容: %r", content[:200])
         return 100, "评分解析失败", True
-
-    score = min(100, max(0, int(score_match.group(1))))
-    reason_match = re.search(r"理由[:：]\s*(.+)", content)
-    reason = reason_match.group(1).strip() if reason_match else ""
-    return score, reason, False
+    return int(parsed["score"]), str(parsed["reason"]), False
 
 
 def should_apply(
@@ -244,6 +230,7 @@ def should_apply(
     min_llm_score: int = 70,
     exclude_keywords: list[str] | None = None,
     vectorstore=None,
+    campaign_key: str = CHINA_CAMPUS_CAMPAIGN.campaign_key,
 ) -> tuple[bool, dict]:
     """多层过滤：黑名单 -> 关键词粗筛 -> 向量语义粗筛 -> LLM 精筛。"""
     
@@ -279,7 +266,13 @@ def should_apply(
         else:
             log.debug("语义距离验证通过 (距离: %.2f)", distance)
 
-    score, reason, degraded = llm_match_score(job_description, resume_text, matched_keywords)
+    score, reason, degraded = llm_match_score(
+        job_description,
+        resume_text,
+        matched_keywords,
+        campaign_key=campaign_key,
+    )
+    policy = match_scoring_policy(campaign_key)
 
     return score >= min_llm_score, {
         "stage": "llm",
@@ -289,4 +282,5 @@ def should_apply(
         "threshold": min_llm_score,
         # True = 评分走了 fail-open（没真评成），上层据此提示"第二层过滤暂时没在跑"
         "scoring_degraded": degraded,
+        "prompt_version": policy.prompt_version,
     }

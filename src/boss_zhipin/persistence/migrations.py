@@ -12,10 +12,12 @@ from boss_zhipin.persistence.schema import (
     AuditEventRow,
     DraftRow,
     EvaluationRow,
+    JobCampaignMatchRow,
     JobRow,
     ProfilePreferenceRow,
     ProfileRow,
     ResumeVersionRow,
+    SearchCampaignRow,
 )
 
 
@@ -48,11 +50,17 @@ def _create_application_tracking(connection: Connection) -> None:
     ApplicationRow.__table__.create(connection, checkfirst=True)
 
 
+def _create_search_campaigns(connection: Connection) -> None:
+    SearchCampaignRow.__table__.create(connection, checkfirst=True)
+    JobCampaignMatchRow.__table__.create(connection, checkfirst=True)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "initial local-first schema", _create_initial_schema),
     Migration(2, "evaluation and human review schema", _create_review_schema),
     Migration(3, "personal job targeting preferences", _create_profile_preferences),
     Migration(4, "application tracking and resume versions", _create_application_tracking),
+    Migration(5, "search campaigns and campaign job matches", _create_search_campaigns),
 )
 
 

@@ -11,10 +11,19 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from boss_zhipin.application.capture_service import CaptureService, JobSource
+from boss_zhipin.domain.campaign import GLOBAL_NEW_GRAD_CAMPAIGN
 from boss_zhipin.domain.job_filter import RuleState
-from boss_zhipin.domain.linkedin_filter import evaluate_linkedin_job_rules
+from boss_zhipin.domain.linkedin_filter import (
+    DEFAULT_LINKEDIN_FILTER,
+    evaluate_linkedin_job_rules,
+)
 from boss_zhipin.persistence.database import Database
-from boss_zhipin.persistence.repositories import JobRepository, ProfileRepository
+from boss_zhipin.persistence.repositories import (
+    JobCampaignMatchRepository,
+    JobRepository,
+    ProfileRepository,
+    SearchCampaignRepository,
+)
 from boss_zhipin.platform.linkedin.cli_source import (
     LinkedInCliJobSource,
     LinkedInCliRunner,
@@ -57,6 +66,20 @@ async def run_linkedin_daily(
             if profile is None:
                 profile = ProfileRepository(session).create(name="2027 global new grad")
             profile_id = profile.id
+            campaign = SearchCampaignRepository(session).upsert(
+                profile_id=profile_id,
+                campaign_key=GLOBAL_NEW_GRAD_CAMPAIGN.campaign_key,
+                name=GLOBAL_NEW_GRAD_CAMPAIGN.name,
+                source_platforms=list(GLOBAL_NEW_GRAD_CAMPAIGN.source_platforms),
+                targeting_config={
+                    "locations": list(DEFAULT_LINKEDIN_FILTER.locations),
+                    "role_signals": list(DEFAULT_LINKEDIN_FILTER.role_signals),
+                    "graduation_year": DEFAULT_LINKEDIN_FILTER.graduation_year,
+                    "sponsorship_required": DEFAULT_LINKEDIN_FILTER.sponsorship_required,
+                },
+                action_strategy=GLOBAL_NEW_GRAD_CAMPAIGN.action_strategy.value,
+            )
+            campaign_id = campaign.id
         capture_source = source or LinkedInCliJobSource(
             LinkedInCliRunner(project_path),
             build_search_routes(),
@@ -65,6 +88,7 @@ async def run_linkedin_daily(
         summary = await CaptureService(database).capture(
             capture_source,
             profile_id=profile_id,
+            campaign_id=campaign_id,
             limit=limit,
         )
         counts = {state.value: 0 for state in RuleState}
@@ -78,6 +102,15 @@ async def run_linkedin_daily(
                     title=job.title,
                     location=job.location,
                     description=job.description,
+                )
+                JobCampaignMatchRepository(session).update_assessment(
+                    campaign_id=campaign_id,
+                    job_id=job.id,
+                    rule_state=match.state.value,
+                    rule_reasons=list(match.reasons),
+                    evaluation_policy_version=(
+                        GLOBAL_NEW_GRAD_CAMPAIGN.evaluation_policy_version
+                    ),
                 )
                 counts[match.state.value] += 1
         return {
@@ -117,4 +150,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

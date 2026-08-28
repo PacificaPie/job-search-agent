@@ -83,6 +83,38 @@ class ProfilePreferenceRow(Base):
     )
 
 
+class SearchCampaignRow(Base):
+    """A bounded job-search direction sharing one candidate profile.
+
+    Profiles describe who the candidate is. Campaigns describe what they are
+    currently looking for, where to discover it, and which human-gated action
+    should follow selection.
+    """
+
+    __tablename__ = "search_campaigns"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "campaign_key", name="uq_campaign_profile_key"),
+        Index("ix_campaigns_active_updated_at", "is_active", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    profile_id: Mapped[str] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    campaign_key: Mapped[str] = mapped_column(String(100), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    source_platforms_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    targeting_config_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    action_strategy: Mapped[str] = mapped_column(String(50), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        UtcDateTime(), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+
 class JobRow(Base):
     __tablename__ = "jobs"
     __table_args__ = (
@@ -108,6 +140,35 @@ class JobRow(Base):
     audit_events: Mapped[list[AuditEventRow]] = relationship(
         back_populates="job", cascade="all, delete-orphan"
     )
+
+
+class JobCampaignMatchRow(Base):
+    """Campaign-specific discovery provenance and latest assessment for a job."""
+
+    __tablename__ = "job_campaign_matches"
+    __table_args__ = (
+        Index("ix_job_campaign_state_score", "campaign_id", "rule_state", "score"),
+    )
+
+    campaign_id: Mapped[str] = mapped_column(
+        ForeignKey("search_campaigns.id", ondelete="CASCADE"), primary_key=True
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    source_route: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    discovery_metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    rule_state: Mapped[str] = mapped_column(String(30), nullable=False, default="")
+    rule_reasons_json: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    score_reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    evaluation_policy_version: Mapped[str] = mapped_column(
+        String(50), nullable=False, default=""
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(UtcDateTime(), nullable=False, default=utc_now)
 
 
 class EvaluationRow(Base):

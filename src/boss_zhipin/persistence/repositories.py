@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from boss_zhipin.domain.campaign import ActionStrategy
 from boss_zhipin.domain.job_identity import canonical_job_key
 from boss_zhipin.domain.models import JobSnapshot
 from boss_zhipin.persistence.schema import (
@@ -15,10 +17,12 @@ from boss_zhipin.persistence.schema import (
     AuditEventRow,
     DraftRow,
     EvaluationRow,
+    JobCampaignMatchRow,
     JobRow,
     ProfilePreferenceRow,
     ProfileRow,
     ResumeVersionRow,
+    SearchCampaignRow,
     utc_now,
 )
 
@@ -100,6 +104,162 @@ class ProfilePreferenceRepository:
 
 def _clean_string_list(values: list[str]) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values if value.strip()))
+
+
+_CAMPAIGN_KEY_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class SearchCampaignRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, campaign_id: str) -> SearchCampaignRow | None:
+        return self.session.get(SearchCampaignRow, campaign_id)
+
+    def get_by_key(self, *, profile_id: str, campaign_key: str) -> SearchCampaignRow | None:
+        return self.session.scalar(
+            select(SearchCampaignRow).where(
+                SearchCampaignRow.profile_id == profile_id,
+                SearchCampaignRow.campaign_key == campaign_key,
+            )
+        )
+
+    def list_active(self, *, profile_id: str) -> list[SearchCampaignRow]:
+        return list(
+            self.session.scalars(
+                select(SearchCampaignRow)
+                .where(
+                    SearchCampaignRow.profile_id == profile_id,
+                    SearchCampaignRow.is_active.is_(True),
+                )
+                .order_by(SearchCampaignRow.created_at, SearchCampaignRow.id)
+            )
+        )
+
+    def upsert(
+        self,
+        *,
+        profile_id: str,
+        campaign_key: str,
+        name: str,
+        source_platforms: list[str],
+        targeting_config: dict[str, Any],
+        action_strategy: str,
+        is_active: bool = True,
+    ) -> SearchCampaignRow:
+        normalized_key = campaign_key.strip()
+        normalized_name = name.strip()
+        platforms = _clean_string_list(source_platforms)
+        if not _CAMPAIGN_KEY_RE.fullmatch(normalized_key):
+            raise ValueError("campaign key must be a lowercase kebab-case identifier")
+        if not normalized_name:
+            raise ValueError("campaign name cannot be empty")
+        if not platforms:
+            raise ValueError("campaign requires at least one source platform")
+        try:
+            strategy = ActionStrategy(action_strategy)
+        except ValueError as exc:
+            raise ValueError(f"unsupported campaign action strategy: {action_strategy}") from exc
+
+        campaign = self.get_by_key(profile_id=profile_id, campaign_key=normalized_key)
+        if campaign is None:
+            campaign = SearchCampaignRow(
+                profile_id=profile_id,
+                campaign_key=normalized_key,
+                name=normalized_name,
+                source_platforms_json=platforms,
+                targeting_config_json=dict(targeting_config),
+                action_strategy=strategy.value,
+                is_active=is_active,
+            )
+            self.session.add(campaign)
+        else:
+            campaign.name = normalized_name
+            campaign.source_platforms_json = platforms
+            campaign.targeting_config_json = dict(targeting_config)
+            campaign.action_strategy = strategy.value
+            campaign.is_active = is_active
+            campaign.updated_at = utc_now()
+        self.session.flush()
+        return campaign
+
+
+class JobCampaignMatchRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get(self, *, campaign_id: str, job_id: str) -> JobCampaignMatchRow | None:
+        return self.session.get(JobCampaignMatchRow, (campaign_id, job_id))
+
+    def observe(
+        self,
+        *,
+        campaign_id: str,
+        job_id: str,
+        source_route: str = "",
+        discovery_metadata: dict[str, Any] | None = None,
+        observed_at: datetime | None = None,
+    ) -> JobCampaignMatchRow:
+        now = observed_at or utc_now()
+        match = self.get(campaign_id=campaign_id, job_id=job_id)
+        if match is None:
+            match = JobCampaignMatchRow(
+                campaign_id=campaign_id,
+                job_id=job_id,
+                source_route=source_route.strip(),
+                discovery_metadata_json=dict(discovery_metadata or {}),
+                first_seen_at=now,
+                last_seen_at=now,
+            )
+            self.session.add(match)
+        else:
+            if source_route.strip():
+                match.source_route = source_route.strip()
+            if discovery_metadata:
+                match.discovery_metadata_json = dict(discovery_metadata)
+            match.last_seen_at = now
+        self.session.flush()
+        return match
+
+    def update_assessment(
+        self,
+        *,
+        campaign_id: str,
+        job_id: str,
+        rule_state: str,
+        rule_reasons: list[str],
+        score: int | None = None,
+        score_reason: str = "",
+        evaluation_policy_version: str = "",
+    ) -> JobCampaignMatchRow:
+        if score is not None and not 0 <= score <= 100:
+            raise ValueError("campaign match score must be between 0 and 100")
+        match = self.get(campaign_id=campaign_id, job_id=job_id)
+        if match is None:
+            raise ValueError("job has not been observed in this campaign")
+        match.rule_state = rule_state.strip()
+        match.rule_reasons_json = _clean_string_list(rule_reasons)
+        match.score = score
+        match.score_reason = score_reason.strip()
+        match.evaluation_policy_version = evaluation_policy_version.strip()
+        self.session.flush()
+        return match
+
+    def list_for_campaign(
+        self, *, campaign_id: str, offset: int = 0, limit: int = 100
+    ) -> list[JobCampaignMatchRow]:
+        return list(
+            self.session.scalars(
+                select(JobCampaignMatchRow)
+                .where(JobCampaignMatchRow.campaign_id == campaign_id)
+                .order_by(
+                    JobCampaignMatchRow.last_seen_at.desc(),
+                    JobCampaignMatchRow.job_id,
+                )
+                .offset(offset)
+                .limit(limit)
+            )
+        )
 
 
 class JobRepository:

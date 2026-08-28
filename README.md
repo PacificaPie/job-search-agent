@@ -109,8 +109,13 @@ uv run --project ../linkedin-cli-frizynn linkedin auth-status
 uv run linkedin-job-daily --per-route 3 --limit 30
 ```
 
-结果与 BOSS 岗位一起进入桌面 App「待审核」页，并显示平台标签。该命令只抓取、
+结果与 BOSS 岗位写入同一个岗位库，但分别归属「海外 New Grad」和「国内校招」
+Campaign。两条线保留各自的召回、筛选与打分口径，不直接混排分数。该命令只抓取、
 去重和筛选，**不会发连接邀请、不会发私信、不会自动投递**。
+
+BOSS 线使用平台中由本人设置的固定招呼语：本系统负责发现、排序和记录值得沟通的
+岗位，不再要求为每个 BOSS 岗位生成个性化草稿，也不会代替本人点击「立即沟通」。
+海外线则可以在人工选中岗位后继续准备定制简历和英文 outreach。
 
 ---
 

@@ -445,6 +445,7 @@ def _prepare_review_job(job_id: str) -> None:
 
     from boss_zhipin.application.draft_service import DraftService
     from boss_zhipin.application.evaluation_service import EvaluationService
+    from boss_zhipin.domain.campaign import campaign_spec_for_platform
     from boss_zhipin.gui.resume_io import current_resume
     from boss_zhipin.models.job_matcher import (
         extract_keywords_from_text,
@@ -455,6 +456,7 @@ def _prepare_review_job(job_id: str) -> None:
     from boss_zhipin.persistence.repositories import (
         ProfilePreferenceRepository,
         ProfileRepository,
+        JobRepository,
     )
     from boss_zhipin.vectorization import embed_resume
 
@@ -479,6 +481,10 @@ def _prepare_review_job(job_id: str) -> None:
                 else list(profile.exclude_keywords_json or [])
             )
             fixed_greeting = preference.fixed_greeting if preference is not None else ""
+            job = JobRepository(session).get(job_id)
+            if job is None:
+                raise ValueError(f"岗位不存在：{job_id}")
+            campaign_key = campaign_spec_for_platform(job.platform).campaign_key
 
         usr_name = environ.get("BOSS_USR_NAME", "").strip()
         if not fixed_greeting and not usr_name:
@@ -499,6 +505,7 @@ def _prepare_review_job(job_id: str) -> None:
                 min_match_score,
                 exclude_keywords,
                 vectorstore,
+                campaign_key=campaign_key,
             )
             return {**details, "recommended": recommended}
 

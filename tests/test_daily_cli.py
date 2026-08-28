@@ -8,7 +8,12 @@ from boss_zhipin import daily_cli
 from boss_zhipin.application.targeting_service import TargetingService
 from boss_zhipin.domain.models import JobSnapshot
 from boss_zhipin.persistence.database import Database
-from boss_zhipin.persistence.repositories import ProfileRepository
+from boss_zhipin.domain.campaign import CHINA_CAMPUS_CAMPAIGN_KEY
+from boss_zhipin.persistence.repositories import (
+    JobCampaignMatchRepository,
+    ProfileRepository,
+    SearchCampaignRepository,
+)
 
 
 def test_daily_parser_defaults():
@@ -60,3 +65,14 @@ def test_run_daily_captures_and_reports_screening(monkeypatch, tmp_path):
     assert result["observed"] == 1
     assert result["created"] == 1
     assert result["eligible"] == 1
+    with database.session() as session:
+        profile = ProfileRepository(session).get_active()
+        campaign = SearchCampaignRepository(session).get_by_key(
+            profile_id=profile.id,
+            campaign_key=CHINA_CAMPUS_CAMPAIGN_KEY,
+        )
+        matches = JobCampaignMatchRepository(session).list_for_campaign(
+            campaign_id=campaign.id
+        )
+        assert campaign.action_strategy == "boss_fixed_greeting"
+        assert [match.rule_state for match in matches] == ["eligible"]

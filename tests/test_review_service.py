@@ -43,6 +43,7 @@ def test_evaluate_generate_edit_and_approve(tmp_path):
                 "score": 86,
                 "reason": "AI 产品经验匹配",
                 "matched_keywords": ["AI", "产品"],
+                "prompt_version": "cn-match-v2",
             },
             model="test-model",
         )

@@ -110,7 +110,9 @@ class TestLlmMatchScore:
     def test_parses_score_and_reason(self, monkeypatch, fake_client, telemetry_spy):
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
-            lambda client, **kwargs: _fake_response("分数: 85\n理由: 技能高度匹配"),
+            lambda client, **kwargs: _fake_response(
+                '{"score": 85, "keywords": ["Python"], "reason": "技能高度匹配"}'
+            ),
         )
         score, reason, degraded = llm_match_score("JD", "简历", ["Python"])
         assert score == 85
@@ -124,7 +126,9 @@ class TestLlmMatchScore:
     def test_parses_plain_string_response(self, monkeypatch, fake_client, telemetry_spy):
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
-            lambda client, **kwargs: "分数: 85\n理由: 技能高度匹配",
+            lambda client, **kwargs: (
+                '{"score": 85, "keywords": ["Python"], "reason": "技能高度匹配"}'
+            ),
         )
         score, reason, degraded = llm_match_score("JD", "简历", ["Python"])
         assert score == 85
@@ -134,12 +138,12 @@ class TestLlmMatchScore:
         assert telemetry_spy[0]["ok"] is True
         assert telemetry_spy[0]["input_tokens"] == 0
 
-    def test_parses_fullwidth_colon(self, monkeypatch, fake_client, telemetry_spy):
-        # 中文 LLM（尤其 DeepSeek）常用全角冒号回复；只认 ASCII ":" 会让解析
-        # 静默失败 → fail-open 恒 100 → 第二层过滤被绕过。必须两种冒号都认。
+    def test_parses_json_inside_markdown_fence(self, monkeypatch, fake_client, telemetry_spy):
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
-            lambda client, **kwargs: _fake_response("分数：85\n理由：技能高度匹配"),
+            lambda client, **kwargs: _fake_response(
+                '```json\n{"score": 85, "keywords": [], "reason": "技能高度匹配"}\n```'
+            ),
         )
         score, reason, _ = llm_match_score("JD", "简历", ["Python"])
         assert score == 85
@@ -148,7 +152,9 @@ class TestLlmMatchScore:
     def test_score_clamped_to_100(self, monkeypatch, fake_client, telemetry_spy):
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
-            lambda client, **kwargs: _fake_response("分数: 150\n理由: 超纲了"),
+            lambda client, **kwargs: _fake_response(
+                '{"score": 150, "keywords": [], "reason": "超纲了"}'
+            ),
         )
         score, _, _ = llm_match_score("JD", "简历", [])
         assert score == 100
@@ -175,7 +181,7 @@ class TestLlmMatchScore:
         assert telemetry_spy[0]["ok"] is False
 
     def test_fail_open_on_unparseable_reply(self, monkeypatch, fake_client, telemetry_spy):
-        # LLM 没按 "分数: NN" 格式回复 → 必须放行，不能按 0 分静默跳过
+        # LLM 没按被测 JSON 契约回复 → 必须放行，不能按 0 分静默跳过
         monkeypatch.setattr(
             job_matcher, "_call_chat_completion",
             lambda client, **kwargs: _fake_response("我觉得这个职位很适合你！"),
@@ -199,7 +205,9 @@ class TestShouldApply:
 
     def test_passes_both_stages(self, monkeypatch):
         monkeypatch.setattr(
-            job_matcher, "llm_match_score", lambda jd, resume, kws: (80, "匹配", False)
+            job_matcher,
+            "llm_match_score",
+            lambda jd, resume, kws, **kwargs: (80, "匹配", False),
         )
         apply, details = should_apply(
             "招聘 Python 工程师，熟悉 Docker", ["Python", "Docker"], "简历全文",
@@ -212,7 +220,9 @@ class TestShouldApply:
 
     def test_rejected_at_llm_stage(self, monkeypatch):
         monkeypatch.setattr(
-            job_matcher, "llm_match_score", lambda jd, resume, kws: (40, "匹配度低", False)
+            job_matcher,
+            "llm_match_score",
+            lambda jd, resume, kws, **kwargs: (40, "匹配度低", False),
         )
         apply, details = should_apply(
             "招聘 Python 工程师，熟悉 Docker", ["Python", "Docker"], "简历全文",
@@ -225,7 +235,9 @@ class TestShouldApply:
         # 评分 fail-open（返回 degraded=True）→ should_apply 在 details 里带出来，
         # 让主循环能提示用户"第二层过滤暂时没在跑"。
         monkeypatch.setattr(
-            job_matcher, "llm_match_score", lambda jd, resume, kws: (100, "无法评分（LLM 未配置）", True)
+            job_matcher,
+            "llm_match_score",
+            lambda jd, resume, kws, **kwargs: (100, "无法评分（LLM 未配置）", True),
         )
         apply, details = should_apply(
             "招聘 Python 工程师，熟悉 Docker", ["Python", "Docker"], "简历全文",

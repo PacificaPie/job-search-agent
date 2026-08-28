@@ -54,11 +54,16 @@ class EvaluationService:
                 reason=str(details.get("reason") or ""),
                 degraded=bool(details.get("scoring_degraded", False)),
                 model=model,
+                prompt_version=str(details.get("prompt_version") or "v1"),
             )
             AuditEventRepository(session).record(
                 "job_evaluated",
                 job_id=job_id,
                 profile_id=profile_id,
-                payload={"evaluation_id": evaluation.id, "score": evaluation.score},
+                payload={
+                    "evaluation_id": evaluation.id,
+                    "score": evaluation.score,
+                    "prompt_version": evaluation.prompt_version,
+                },
             )
             return evaluation.id

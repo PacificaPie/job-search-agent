@@ -96,7 +96,7 @@ def test_build_report_and_render_are_readonly(tmp_path):
 def test_pending_migrations_is_empty_after_initialize(tmp_path):
     database = Database(tmp_path / "reachout.db")
     try:
-        assert database.pending_migrations() == (1, 2, 3, 4)
+        assert database.pending_migrations() == (1, 2, 3, 4, 5)
         database.initialize()
         assert database.pending_migrations() == ()
     finally:

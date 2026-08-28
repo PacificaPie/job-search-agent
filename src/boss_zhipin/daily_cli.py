@@ -12,8 +12,16 @@ from dotenv import load_dotenv
 
 from boss_zhipin.application.capture_service import CaptureService
 from boss_zhipin.application.review_service import ReviewService
+from boss_zhipin.domain.campaign import CHINA_CAMPUS_CAMPAIGN
+from boss_zhipin.domain.job_filter import JobFilterConfig, evaluate_job_rules
 from boss_zhipin.persistence.database import Database
-from boss_zhipin.persistence.repositories import ProfilePreferenceRepository, ProfileRepository
+from boss_zhipin.persistence.repositories import (
+    JobCampaignMatchRepository,
+    JobRepository,
+    ProfilePreferenceRepository,
+    ProfileRepository,
+    SearchCampaignRepository,
+)
 from boss_zhipin.platform.boss.targeted_capture import (
     BossTargetedJobSource,
     build_search_routes,
@@ -52,13 +60,56 @@ async def run_daily(*, per_route: int = 5, limit: int = 60) -> dict[str, int]:
                 raise ValueError("还没有个人筛选配置")
             profile_id = profile.id
             cities = list(preference.target_cities_json)
+            filter_config = JobFilterConfig(
+                target_cities=tuple(preference.target_cities_json),
+                target_roles=tuple(preference.target_roles_json),
+                employment_types=tuple(preference.employment_types_json),
+                title_excludes=tuple(preference.title_excludes_json),
+                content_excludes=tuple(preference.content_excludes_json),
+            )
+            campaign = SearchCampaignRepository(session).upsert(
+                profile_id=profile_id,
+                campaign_key=CHINA_CAMPUS_CAMPAIGN.campaign_key,
+                name=CHINA_CAMPUS_CAMPAIGN.name,
+                source_platforms=list(CHINA_CAMPUS_CAMPAIGN.source_platforms),
+                targeting_config={
+                    "target_cities": list(preference.target_cities_json),
+                    "target_roles": list(preference.target_roles_json),
+                    "employment_types": list(preference.employment_types_json),
+                },
+                action_strategy=CHINA_CAMPUS_CAMPAIGN.action_strategy.value,
+            )
+            campaign_id = campaign.id
 
         routes = build_search_routes(cities, list(DEFAULT_QUERIES))
         summary = await CaptureService(database).capture(
             BossTargetedJobSource(routes, per_route_limit=per_route),
             profile_id=profile_id,
+            campaign_id=campaign_id,
             limit=limit,
         )
+        with database.session() as session:
+            jobs = JobRepository(session)
+            matches = JobCampaignMatchRepository(session)
+            for job_id in summary.job_ids:
+                job = jobs.get(job_id)
+                if job is None:
+                    continue
+                assessment = evaluate_job_rules(
+                    title=job.title,
+                    location=job.location,
+                    description=job.description,
+                    config=filter_config,
+                )
+                matches.update_assessment(
+                    campaign_id=campaign_id,
+                    job_id=job.id,
+                    rule_state=assessment.state.value,
+                    rule_reasons=list(assessment.reasons),
+                    evaluation_policy_version=(
+                        CHINA_CAMPUS_CAMPAIGN.evaluation_policy_version
+                    ),
+                )
         queue = ReviewService(database).list_jobs(limit=100)
         return {
             "observed": summary.observed,

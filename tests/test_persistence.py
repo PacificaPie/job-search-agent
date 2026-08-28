@@ -3,21 +3,26 @@
 from sqlalchemy import func, select, text
 
 from boss_zhipin.domain.models import JobSnapshot
+from boss_zhipin.domain.campaign import ActionStrategy
 from boss_zhipin.persistence.database import Database, default_database_path
 from boss_zhipin.persistence.migrations import MIGRATIONS
 from boss_zhipin.persistence.repositories import (
     AuditEventRepository,
+    JobCampaignMatchRepository,
     JobRepository,
     ProfilePreferenceRepository,
     ProfileRepository,
+    SearchCampaignRepository,
 )
 from boss_zhipin.persistence.schema import (
     AuditEventRow,
     DraftRow,
     EvaluationRow,
     JobRow,
+    JobCampaignMatchRow,
     ProfilePreferenceRow,
     ProfileRow,
+    SearchCampaignRow,
 )
 
 
@@ -30,7 +35,7 @@ def test_default_database_path_can_be_overridden(monkeypatch, tmp_path):
 def test_initialize_is_versioned_and_idempotent(tmp_path):
     database = Database(tmp_path / "reachout.db")
     try:
-        assert database.initialize() == (1, 2, 3, 4)
+        assert database.initialize() == (1, 2, 3, 4, 5)
         assert database.initialize() == ()
         with database.engine.connect() as connection:
             tables = {
@@ -49,6 +54,8 @@ def test_initialize_is_versioned_and_idempotent(tmp_path):
                 "profile_preferences",
                 "resume_versions",
                 "applications",
+                "search_campaigns",
+                "job_campaign_matches",
             } <= tables
             assert connection.execute(text("PRAGMA foreign_keys")).scalar_one() == 1
     finally:
@@ -83,11 +90,114 @@ def test_existing_v1_database_upgrades_without_losing_jobs(tmp_path):
             )
             job_id = job.id
 
-        assert database.initialize() == (2, 3, 4)
+        assert database.initialize() == (2, 3, 4, 5)
         with database.session() as session:
             assert JobRepository(session).get(job_id).title == "Existing job"
             assert session.scalar(select(func.count()).select_from(EvaluationRow)) == 0
             assert session.scalar(select(func.count()).select_from(DraftRow)) == 0
+    finally:
+        database.close()
+
+
+def test_campaigns_separate_search_intent_from_canonical_jobs(tmp_path):
+    database = Database(tmp_path / "reachout.db")
+    database.initialize()
+    try:
+        with database.session() as session:
+            profile = ProfileRepository(session).create(name="AI product roles")
+            campaigns = SearchCampaignRepository(session)
+            china = campaigns.upsert(
+                profile_id=profile.id,
+                campaign_key="cn-2027-ai-product",
+                name="国内校招",
+                source_platforms=["boss_zhipin", "boss_zhipin"],
+                targeting_config={"cities": ["北京", "上海"]},
+                action_strategy=ActionStrategy.BOSS_FIXED_GREETING.value,
+            )
+            global_campaign = campaigns.upsert(
+                profile_id=profile.id,
+                campaign_key="global-2027-ai-product",
+                name="海外 New Grad",
+                source_platforms=["linkedin", "company_site"],
+                targeting_config={"sponsorship_required": True},
+                action_strategy=ActionStrategy.TAILORED_APPLICATION.value,
+            )
+            job, _ = JobRepository(session).upsert_snapshot(
+                JobSnapshot(
+                    title="AI Product Manager",
+                    company="Example",
+                    external_id="shared-job",
+                )
+            )
+            matches = JobCampaignMatchRepository(session)
+            matches.observe(campaign_id=china.id, job_id=job.id, source_route="北京 / AI PM")
+            matches.update_assessment(
+                campaign_id=china.id,
+                job_id=job.id,
+                rule_state="eligible",
+                rule_reasons=["城市：北京"],
+                score=82,
+                evaluation_policy_version="boss-rules-v1",
+            )
+            matches.observe(campaign_id=global_campaign.id, job_id=job.id)
+            profile_id = profile.id
+            job_id = job.id
+            china_id = china.id
+
+        with database.session() as session:
+            campaigns = SearchCampaignRepository(session).list_active(profile_id=profile_id)
+            assert [campaign.campaign_key for campaign in campaigns] == [
+                "cn-2027-ai-product",
+                "global-2027-ai-product",
+            ]
+            assert campaigns[0].source_platforms_json == ["boss_zhipin"]
+            match = JobCampaignMatchRepository(session).get(
+                campaign_id=china_id,
+                job_id=job_id,
+            )
+            assert match.rule_state == "eligible"
+            assert match.score == 82
+            assert session.scalar(select(func.count()).select_from(SearchCampaignRow)) == 2
+            assert session.scalar(select(func.count()).select_from(JobCampaignMatchRow)) == 2
+            assert session.scalar(select(func.count()).select_from(JobRow)) == 1
+    finally:
+        database.close()
+
+
+def test_campaign_repository_rejects_ambiguous_identity_and_strategy(tmp_path):
+    database = Database(tmp_path / "reachout.db")
+    database.initialize()
+    try:
+        with database.session() as session:
+            profile = ProfileRepository(session).create(name="AI roles")
+            campaigns = SearchCampaignRepository(session)
+            try:
+                campaigns.upsert(
+                    profile_id=profile.id,
+                    campaign_key="China Campaign",
+                    name="国内校招",
+                    source_platforms=["boss_zhipin"],
+                    targeting_config={},
+                    action_strategy=ActionStrategy.BOSS_FIXED_GREETING.value,
+                )
+            except ValueError as exc:
+                assert "kebab-case" in str(exc)
+            else:
+                raise AssertionError("ambiguous campaign key should fail")
+
+            try:
+                campaigns.upsert(
+                    profile_id=profile.id,
+                    campaign_key="cn-campus",
+                    name="国内校招",
+                    source_platforms=["boss_zhipin"],
+                    targeting_config={},
+                    action_strategy="auto_send",
+                )
+            except ValueError as exc:
+                assert "unsupported campaign action strategy" in str(exc)
+            else:
+                raise AssertionError("unknown action strategy should fail")
     finally:
         database.close()
 

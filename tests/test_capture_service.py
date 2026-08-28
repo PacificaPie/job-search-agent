@@ -10,8 +10,13 @@ from sqlalchemy import func, select
 from boss_zhipin.application.capture_service import CaptureService
 from boss_zhipin.domain.models import JobSnapshot
 from boss_zhipin.persistence.database import Database
-from boss_zhipin.persistence.repositories import ProfileRepository
-from boss_zhipin.persistence.schema import AuditEventRow, JobRow
+from boss_zhipin.domain.campaign import ActionStrategy
+from boss_zhipin.persistence.repositories import (
+    JobCampaignMatchRepository,
+    ProfileRepository,
+    SearchCampaignRepository,
+)
+from boss_zhipin.persistence.schema import AuditEventRow, JobCampaignMatchRow, JobRow
 
 
 class FakeJobSource:
@@ -86,5 +91,83 @@ def test_capture_rejects_invalid_limit(tmp_path):
             assert "at least 1" in str(exc)
         else:
             raise AssertionError("zero limit should fail")
+    finally:
+        database.close()
+
+
+def test_capture_records_campaign_membership_without_duplicating_job(tmp_path):
+    database, profile_id = _database_with_profile(tmp_path)
+    try:
+        with database.session() as session:
+            campaign = SearchCampaignRepository(session).upsert(
+                profile_id=profile_id,
+                campaign_key="cn-2027-ai-product",
+                name="国内校招",
+                source_platforms=["boss_zhipin"],
+                targeting_config={"cities": ["北京"]},
+                action_strategy=ActionStrategy.BOSS_FIXED_GREETING.value,
+            )
+            campaign_id = campaign.id
+
+        service = CaptureService(database)
+        snapshot = JobSnapshot(title="AI PM", company="A", external_id="one")
+        first = asyncio.run(
+            service.capture(
+                FakeJobSource([snapshot]),
+                profile_id=profile_id,
+                campaign_id=campaign_id,
+                source_route="北京 / AI 产品经理",
+            )
+        )
+        second = asyncio.run(
+            service.capture(
+                FakeJobSource([snapshot]),
+                profile_id=profile_id,
+                campaign_id=campaign_id,
+            )
+        )
+
+        with database.session() as session:
+            match = JobCampaignMatchRepository(session).get(
+                campaign_id=campaign_id,
+                job_id=first.job_ids[0],
+            )
+            assert first.job_ids == second.job_ids
+            assert match.source_route == "北京 / AI 产品经理"
+            assert session.scalar(select(func.count()).select_from(JobRow)) == 1
+            assert session.scalar(select(func.count()).select_from(JobCampaignMatchRow)) == 1
+    finally:
+        database.close()
+
+
+def test_capture_rejects_platform_outside_campaign(tmp_path):
+    database, profile_id = _database_with_profile(tmp_path)
+    try:
+        with database.session() as session:
+            campaign = SearchCampaignRepository(session).upsert(
+                profile_id=profile_id,
+                campaign_key="cn-2027-ai-product",
+                name="国内校招",
+                source_platforms=["boss_zhipin"],
+                targeting_config={},
+                action_strategy=ActionStrategy.BOSS_FIXED_GREETING.value,
+            )
+            campaign_id = campaign.id
+
+        try:
+            asyncio.run(
+                CaptureService(database).capture(
+                    FakeJobSource([JobSnapshot(platform="linkedin", title="AI PM")]),
+                    profile_id=profile_id,
+                    campaign_id=campaign_id,
+                )
+            )
+        except ValueError as exc:
+            assert "not enabled for campaign" in str(exc)
+        else:
+            raise AssertionError("campaign should reject a platform outside its sources")
+
+        with database.session() as session:
+            assert session.scalar(select(func.count()).select_from(JobRow)) == 0
     finally:
         database.close()
